@@ -27,3 +27,6 @@ dist-ssr
 BDD/backups/
 *.db-wal
 *.db-shm
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
