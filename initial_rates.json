@@ -39,7 +39,7 @@
     "code": "3.1.0.1",
     "branche": "Automobile",
     "sous_code": "VINV",
-    "sous_libelle": "Incendie de V؟©hicule",
+    "sous_libelle": "Incendie de Véhicule",
     "taux_apport_courtier": 0.1,
     "taux_apport_aga": 0.1,
     "taux_gestion_aga": 0.05
@@ -48,7 +48,7 @@
     "code": "3.1.0.1",
     "branche": "Automobile",
     "sous_code": "VOLV",
-    "sous_libelle": "Vol de V؟©hicule",
+    "sous_libelle": "Vol de Véhicule",
     "taux_apport_courtier": 0.1,
     "taux_apport_aga": 0.1,
     "taux_gestion_aga": 0.05

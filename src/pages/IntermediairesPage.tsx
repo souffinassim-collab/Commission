@@ -10,10 +10,12 @@ import {
   MapPin, 
   Percent,
   Search,
-  CheckCircle2
+  CheckCircle2,
+  Trash2
 } from 'lucide-react';
 import { Intermediaire, IntermediaireType } from '../types';
-import { api } from '../lib/api';
+import { api, errMsg } from '../lib/api';
+import { ConfirmDialog, ConfirmState } from '../components/Shared';
 
 export const IntermediairesPage: React.FC = () => {
   const [intermediaires, setIntermediaires] = useState<Intermediaire[]>([]);
@@ -21,6 +23,8 @@ export const IntermediairesPage: React.FC = () => {
   const [showModal, setShowModal] = useState<boolean>(false);
   const [editingItem, setEditingItem] = useState<Intermediaire | null>(null);
   const [searchTerm, setSearchTerm] = useState<string>('');
+  const [confirm, setConfirm] = useState<ConfirmState | null>(null);
+  const [erreur, setErreur] = useState<string | null>(null);
 
   const [form, setForm] = useState<Intermediaire>({
     type_intermediaire: 'AGA',
@@ -77,10 +81,34 @@ export const IntermediairesPage: React.FC = () => {
     try {
       await api.saveIntermediaire(form);
       setShowModal(false);
+      setErreur(null);
       await loadData();
     } catch (err) {
-      alert('Erreur enregistrement: ' + err);
+      alert('Enregistrement refusé : ' + errMsg(err));
     }
+  };
+
+  const handleDelete = (item: Intermediaire) => {
+    setConfirm({
+      title: 'Supprimer cet intermédiaire ?',
+      danger: true,
+      message: (
+        <p>
+          Supprimer définitivement <strong>{item.nom}</strong> ({item.code}) ? Impossible s'il a des bordereaux : désactivez-le
+          alors pour qu'il ne soit plus proposé à l'import.
+        </p>
+      ),
+      confirmLabel: 'Supprimer',
+      onConfirm: async () => {
+        try {
+          await api.deleteIntermediaire(item.id!);
+          setErreur(null);
+          await loadData();
+        } catch (err) {
+          setErreur(errMsg(err));
+        }
+      },
+    });
   };
 
   const filtered = intermediaires.filter(
@@ -110,6 +138,10 @@ export const IntermediairesPage: React.FC = () => {
           <span>Ajouter un Intermédiaire</span>
         </button>
       </div>
+
+      {erreur && (
+        <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-900 text-xs font-medium">{erreur}</div>
+      )}
 
       {/* Search */}
       <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs flex items-center justify-between">
@@ -172,11 +204,19 @@ export const IntermediairesPage: React.FC = () => {
             </div>
 
             <div className="mt-5 pt-3 border-t border-slate-100 flex items-center justify-between">
-              <span className="flex items-center gap-1.5 text-[11px] font-semibold text-emerald-600">
-                <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
-                Actif
+              <span className={`flex items-center gap-1.5 text-[11px] font-semibold ${item.actif ? 'text-emerald-600' : 'text-slate-400'}`}>
+                <span className={`w-2 h-2 rounded-full ${item.actif ? 'bg-emerald-500' : 'bg-slate-300'}`}></span>
+                {item.actif ? 'Actif' : 'Inactif'}
               </span>
 
+              <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => handleDelete(item)}
+                title="Supprimer"
+                className="p-1.5 rounded-lg bg-slate-100 hover:bg-rose-50 hover:text-rose-600 text-slate-500 transition-all cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
               <button
                 onClick={() => openEdit(item)}
                 className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-indigo-50 hover:text-indigo-600 text-slate-700 text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer"
@@ -184,6 +224,7 @@ export const IntermediairesPage: React.FC = () => {
                 <Edit2 className="w-3.5 h-3.5" />
                 <span>Modifier</span>
               </button>
+              </div>
             </div>
           </div>
         ))}
@@ -305,6 +346,15 @@ export const IntermediairesPage: React.FC = () => {
                 </select>
               </div>
 
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.actif}
+                  onChange={(e) => setForm({ ...form, actif: e.target.checked })}
+                />
+                <span className="font-semibold text-slate-700">Actif (proposé lors de l'import)</span>
+              </label>
+
               <div className="flex justify-end gap-2 pt-4 border-t border-slate-100">
                 <button
                   type="button"
@@ -324,6 +374,7 @@ export const IntermediairesPage: React.FC = () => {
           </div>
         </div>
       )}
+      <ConfirmDialog state={confirm} onClose={() => setConfirm(null)} />
     </div>
   );
 };

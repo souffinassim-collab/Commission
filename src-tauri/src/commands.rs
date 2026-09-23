@@ -1,190 +1,529 @@
-use std::sync::Mutex;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use chrono::Local;
+use std::sync::Mutex;
+use serde::Deserialize;
 use tauri::State;
-use crate::db::DatabaseManager;
-use crate::models::{BrancheParam, Intermediaire, Bordereau, CirisPdfExtractedData, DbInfo};
 use crate::calculation::CalculationEngine;
-use crate::parser::CirisPdfParser;
+use crate::db::{DatabaseManager, ImportAEnregistrer};
 use crate::export::ExcelExporter;
+use crate::models::{
+    Anomalie, Bordereau, BrancheParam, CalculateMultiBordereauRequest, DbInfo, ExcelScanResult, Intermediaire,
+    UploadedFileResult,
+};
+use crate::parser::{extract_pages, CirisPdfParser, ExcelProductionParser, FlottePdfParser};
+
+/// Fichier analysé en attente d'enregistrement (contenu conservé jusqu'à l'enregistrement du bordereau)
+pub struct FichierEnAttente {
+    pub contenu: Vec<u8>,
+}
 
 pub struct AppState {
     pub db: Mutex<DatabaseManager>,
+    pub en_attente: Mutex<HashMap<String, FichierEnAttente>>,
 }
+
+impl AppState {
+    pub fn new(db: DatabaseManager) -> Self {
+        Self { db: Mutex::new(db), en_attente: Mutex::new(HashMap::new()) }
+    }
+}
+
+/// Contexte de l'import : chaque fichier est rattaché à l'intermédiaire et à la période du bordereau en cours
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImportContext {
+    /// Intermédiaire du bordereau ; absent si les fichiers sont importés avant de l'identifier
+    #[serde(default)]
+    pub intermediaire_id: Option<i64>,
+    pub exercice: i32,
+    pub mois: Option<i32>,
+    /// Bordereau déjà enregistré en cours de modification (ses propres fichiers ne sont pas des doublons)
+    #[serde(default)]
+    pub bordereau_id: Option<i64>,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn decode_base64_payload(data: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let clean_b64 = match data.find(',') {
+        Some(idx) => &data[idx + 1..],
+        None => data,
+    };
+    let trimmed: String = clean_b64.chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(&trimmed)
+        .map_err(|e| format!("Erreur décodage base64: {}", e))
+}
+
+fn file_name_of(path: &str) -> String {
+    PathBuf::from(path).file_name().and_then(|n| n.to_str()).unwrap_or("fichier").to_string()
+}
+
+/// Analyse d'un fichier selon son type (détection sur le contenu pour les PDF)
+fn parse_file_auto_bytes(
+    bytes: &[u8],
+    file_name: &str,
+    client_filter: Option<&str>,
+    known_codes: &[String],
+) -> Result<UploadedFileResult, String> {
+    let lower = file_name.to_lowercase();
+    if lower.ends_with(".xlsx") || lower.ends_with(".xls") {
+        ExcelProductionParser::parse_from_bytes(bytes, file_name, client_filter)
+    } else if lower.ends_with(".pdf") {
+        let doc = lopdf::Document::load_mem(bytes).map_err(|e| format!("Erreur lecture PDF: {:?}", e))?;
+        let pages = extract_pages(&doc);
+        if CirisPdfParser::is_ciris(&pages) {
+            CirisPdfParser::parse_pages(&pages, file_name, known_codes)
+        } else {
+            let res = FlottePdfParser::parse_pages(&pages, file_name, known_codes);
+            if res.items.is_empty() && res.anomalies.is_empty() {
+                Err(format!(
+                    "« {} » n'est ni un rapport CIRIS ni un PDF de flotte reconnu (aucune garantie trouvée).",
+                    file_name
+                ))
+            } else {
+                Ok(res)
+            }
+        }
+    } else {
+        Err(format!("Format non supporté pour le fichier: {}", file_name))
+    }
+}
+
+/// Contrôles du fichier par rapport au bordereau en cours (intermédiaire, période, doublon).
+/// Les résultats remplacent `anomalies_contexte` ; sans intermédiaire, seul le doublon est contrôlé.
+fn validate_against_context(
+    db: &DatabaseManager,
+    res: &mut UploadedFileResult,
+    ctx: &ImportContext,
+) -> Result<(), String> {
+    res.anomalies_contexte.clear();
+    if let Some((_, num)) = db.find_hash_usage(&res.hash, ctx.bordereau_id)? {
+        res.anomalies_contexte.push(Anomalie::erreur(format!(
+            "Ce fichier a déjà été importé dans le bordereau {} : il ne peut pas être commissionné deux fois.",
+            num
+        )));
+    }
+    let inter = match ctx.intermediaire_id {
+        Some(id) => db.get_intermediaire(id)?.ok_or_else(|| format!("Intermédiaire #{} introuvable.", id))?,
+        None => return Ok(()),
+    };
+    if !inter.actif {
+        res.anomalies_contexte.push(Anomalie::erreur(format!(
+            "L'intermédiaire {} ({}) est désactivé.",
+            inter.nom, inter.code
+        )));
+    }
+
+    if res.file_type == "CIRIS_PDF" {
+        match res.code.as_deref() {
+            Some(code) if code.trim() != inter.code.trim() => res.anomalies_contexte.push(Anomalie::erreur(format!(
+                "Ce rapport CIRIS appartient à l'agence {} ({}) et non à l'intermédiaire sélectionné {} ({}).",
+                code,
+                res.courtier_ou_client.clone().unwrap_or_default(),
+                inter.code,
+                inter.nom
+            ))),
+            _ => {}
+        }
+        if let Some(ex) = res.exercice {
+            if ex != ctx.exercice {
+                res.anomalies_contexte.push(Anomalie::erreur(format!(
+                    "Période du rapport ({}) différente de l'exercice du bordereau ({}).",
+                    res.periode.clone().unwrap_or_default(),
+                    ctx.exercice
+                )));
+            }
+        }
+        if let (Some(m), Some(cm)) = (res.mois, ctx.mois) {
+            if m != cm {
+                res.anomalies_contexte.push(Anomalie::erreur(format!(
+                    "Période du rapport ({}) différente du mois du bordereau ({:02}).",
+                    res.periode.clone().unwrap_or_default(),
+                    cm
+                )));
+            }
+        }
+    } else {
+        let annee = res.exercice.or_else(|| res.periode.as_deref().and_then(|p| p.get(..4)).and_then(|y| y.parse().ok()));
+        if let Some(y) = annee {
+            if y != ctx.exercice {
+                res.anomalies_contexte.push(Anomalie::avertissement(format!(
+                    "Le fichier porte sur l'exercice {} alors que le bordereau est sur {}.",
+                    y, ctx.exercice
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Relance les contrôles de contexte (après identification de l'intermédiaire ou changement de période)
+#[tauri::command]
+pub fn revalider_fichiers(
+    fichiers: Vec<UploadedFileResult>,
+    ctx: ImportContext,
+    state: State<'_, AppState>,
+) -> Result<Vec<UploadedFileResult>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut out = fichiers;
+    for f in out.iter_mut() {
+        validate_against_context(&db, f, &ctx)?;
+    }
+    Ok(out)
+}
+
+fn analyse_et_met_en_attente(
+    state: &State<'_, AppState>,
+    bytes: Vec<u8>,
+    file_name: &str,
+    client_filter: Option<&str>,
+    ctx: &ImportContext,
+) -> Result<UploadedFileResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let known = db.known_sous_codes()?;
+    let mut res = parse_file_auto_bytes(&bytes, file_name, client_filter, &known)?;
+    res.hash = sha256_hex(&bytes);
+    res.taille = bytes.len() as i64;
+    validate_against_context(&db, &mut res, ctx)?;
+    drop(db);
+    state
+        .en_attente
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(res.id.clone(), FichierEnAttente { contenu: bytes });
+    Ok(res)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Base de données
+// ---------------------------------------------------------------------------------------------
 
 #[tauri::command]
 pub fn get_db_info(state: State<'_, AppState>) -> Result<DbInfo, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.get_info().map_err(|e| e.to_string())
+    state.db.lock().map_err(|e| e.to_string())?.get_info()
 }
 
 #[tauri::command]
 pub fn backup_database(state: State<'_, AppState>) -> Result<String, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let path = db.create_pre_migration_backup().map_err(|e| e.to_string())?;
-    Ok(path.to_string_lossy().to_string())
+    Ok(db.create_pre_migration_backup()?.to_string_lossy().to_string())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Paramètres
+// ---------------------------------------------------------------------------------------------
 
 #[tauri::command]
 pub fn get_branches(state: State<'_, AppState>) -> Result<Vec<BrancheParam>, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.get_all_branches().map_err(|e| e.to_string())
+    state.db.lock().map_err(|e| e.to_string())?.get_all_branches()
 }
 
 #[tauri::command]
 pub fn update_branche(branche: BrancheParam, state: State<'_, AppState>) -> Result<(), String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.update_branche(&branche).map_err(|e| e.to_string())
+    state.db.lock().map_err(|e| e.to_string())?.save_branche(&branche).map(|_| ())
 }
 
 #[tauri::command]
-pub fn get_intermediaires(state: State<'_, AppState>) -> Result<Vec<Intermediaire>, String> {
+pub fn save_branche(branche: BrancheParam, state: State<'_, AppState>) -> Result<i64, String> {
+    state.db.lock().map_err(|e| e.to_string())?.save_branche(&branche)
+}
+
+#[tauri::command]
+pub fn delete_branche(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    state.db.lock().map_err(|e| e.to_string())?.delete_branche(id)
+}
+
+#[tauri::command]
+pub fn reset_branches_to_default(state: State<'_, AppState>) -> Result<Vec<BrancheParam>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.get_all_intermediaires().map_err(|e| e.to_string())
+    db.reset_branches_to_default()?;
+    db.get_all_branches()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Intermédiaires
+// ---------------------------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn get_intermediaires(state: State<'_, AppState>) -> Result<Vec<Intermediaire>, String> {
+    state.db.lock().map_err(|e| e.to_string())?.get_all_intermediaires()
 }
 
 #[tauri::command]
 pub fn save_intermediaire(item: Intermediaire, state: State<'_, AppState>) -> Result<i64, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.save_intermediaire(&item).map_err(|e| e.to_string())
+    state.db.lock().map_err(|e| e.to_string())?.save_intermediaire(&item)
 }
 
 #[tauri::command]
-pub fn parse_ciris_pdf(file_path: String) -> Result<CirisPdfExtractedData, String> {
+pub fn delete_intermediaire(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    state.db.lock().map_err(|e| e.to_string())?.delete_intermediaire(id)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Import de fichiers
+// ---------------------------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn scan_excel_clients(file_path: String) -> Result<ExcelScanResult, String> {
     let bytes = fs::read(&file_path).map_err(|e| format!("Impossible de lire le fichier: {}", e))?;
-    CirisPdfParser::parse_from_bytes(&bytes)
+    ExcelProductionParser::scan_clients_from_bytes(&bytes, &file_name_of(&file_path))
 }
 
 #[tauri::command]
-pub fn parse_ciris_pdf_base64(base64_data: String) -> Result<CirisPdfExtractedData, String> {
-    use base64::Engine;
-
-    // Si l'utilisateur dépose le fichier depuis le frontend en base64 (avec préfixe data:application/pdf;base64,...)
-    let clean_b64 = if let Some(idx) = base64_data.find(',') {
-        &base64_data[idx + 1..]
-    } else {
-        &base64_data
-    };
-
-    let trimmed: String = clean_b64.chars().filter(|c| !c.is_whitespace()).collect();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&trimmed)
-        .map_err(|e| format!("Erreur décodage base64: {}", e))?;
-
-    CirisPdfParser::parse_from_bytes(&bytes)
+pub fn scan_excel_clients_base64(base64_data: String, file_name: String) -> Result<ExcelScanResult, String> {
+    let bytes = decode_base64_payload(&base64_data)?;
+    ExcelProductionParser::scan_clients_from_bytes(&bytes, &file_name)
 }
 
 #[tauri::command]
-pub fn calculate_bordereau_from_pdf(
-    extracted_data: CirisPdfExtractedData,
-    type_intermediaire: String,
-    tva_taux: f64,
-    succursale: String,
-    departement: String,
+pub fn parse_file_auto(
+    file_path: String,
+    client_filter: Option<String>,
+    ctx: ImportContext,
+    state: State<'_, AppState>,
+) -> Result<UploadedFileResult, String> {
+    let bytes = fs::read(&file_path).map_err(|e| format!("Impossible de lire le fichier: {}", e))?;
+    analyse_et_met_en_attente(&state, bytes, &file_name_of(&file_path), client_filter.as_deref(), &ctx)
+}
+
+#[tauri::command]
+pub fn parse_file_auto_base64(
+    base64_data: String,
+    file_name: String,
+    client_filter: Option<String>,
+    ctx: ImportContext,
+    state: State<'_, AppState>,
+) -> Result<UploadedFileResult, String> {
+    let bytes = decode_base64_payload(&base64_data)?;
+    analyse_et_met_en_attente(&state, bytes, &file_name, client_filter.as_deref(), &ctx)
+}
+
+/// Abandon de l'import en cours : libère les fichiers en attente
+#[tauri::command]
+pub fn clear_pending_files(ids: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+    let mut map = state.en_attente.lock().map_err(|e| e.to_string())?;
+    for id in ids {
+        map.remove(&id);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn calculate_multi_bordereau(
+    req: CalculateMultiBordereauRequest,
     state: State<'_, AppState>,
 ) -> Result<Bordereau, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let branches = db.get_all_branches().map_err(|e| e.to_string())?;
-
-    let mut lignes = Vec::new();
-    let mut total_prime_nette = 0.0;
-    let mut total_commission_apport = 0.0;
-    let mut total_commission_gestion = 0.0;
-
-    for item in &extracted_data.items {
-        let matched = CalculationEngine::match_branche(item, &branches);
-        let ligne = CalculationEngine::compute_ligne(item, matched, &type_intermediaire, tva_taux);
-        
-        total_prime_nette += ligne.prime_nette;
-        total_commission_apport += ligne.montant_apport;
-        total_commission_gestion += ligne.montant_gestion;
-        lignes.push(ligne);
-    }
-
-    total_prime_nette = CalculationEngine::round_cents(total_prime_nette);
-    total_commission_apport = CalculationEngine::round_cents(total_commission_apport);
-    total_commission_gestion = CalculationEngine::round_cents(total_commission_gestion);
-    let total_commission_ht = CalculationEngine::round_cents(total_commission_apport + total_commission_gestion);
-    let total_tva = CalculationEngine::round_cents(total_commission_ht * tva_taux);
-    let total_commission_ttc = CalculationEngine::round_cents(total_commission_ht + total_tva);
-
-    let num_bordereau = format!(
-        "BORD-{}-{}-{:02}",
-        type_intermediaire,
-        extracted_data.exercice,
-        extracted_data.mois
-    );
-
-    let now = Local::now().format("%Y-%m-%d").to_string();
-
-    Ok(Bordereau {
-        id: None,
-        intermediaire_id: None,
-        intermediaire_nom: extracted_data.agence_nom.clone(),
-        intermediaire_code: extracted_data.agence_code.clone(),
-        type_intermediaire,
-        numero_bordereau: num_bordereau,
-        exercice: extracted_data.exercice,
-        mois: Some(extracted_data.mois),
-        code_client: None,
-        succursale,
-        departement,
-        tva_taux,
-        date_generation: now,
-        total_prime_nette,
-        total_commission_apport,
-        total_commission_gestion,
-        total_commission_ht,
-        total_tva,
-        total_commission_ttc,
-        statut: "BROUILLON".to_string(),
-        lignes,
-    })
+    let branches = db.get_all_branches()?;
+    Ok(CalculationEngine::compute_multi_bordereau(&req, &branches))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Bordereaux
+// ---------------------------------------------------------------------------------------------
+
 #[tauri::command]
-pub fn save_bordereau(bordereau: Bordereau, state: State<'_, AppState>) -> Result<i64, String> {
+pub fn save_bordereau(
+    bordereau: Bordereau,
+    fichiers: Option<Vec<UploadedFileResult>>,
+    state: State<'_, AppState>,
+) -> Result<i64, String> {
+    let mut bordereau = bordereau;
+    if let Some(a) = bordereau.anomalies_bloquantes().first() {
+        return Err(format!("Enregistrement impossible : {}", a.message));
+    }
+    // Contrôles de contexte rejoués côté serveur : intermédiaire, période, fichier déjà commissionné
+    let mut fichiers = fichiers;
+    if let Some(list) = fichiers.as_mut() {
+        let ctx = ImportContext {
+            intermediaire_id: bordereau.intermediaire_id,
+            exercice: bordereau.exercice,
+            mois: bordereau.mois,
+            bordereau_id: bordereau.id,
+        };
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        for f in list.iter_mut() {
+            validate_against_context(&db, f, &ctx)?;
+        }
+    }
+    // Cohérence montants/totaux à partir des taux figés dans chaque ligne (le barème n'est pas relu)
+    CalculationEngine::recompute_bordereau(&mut bordereau);
+
+    let en_attente = state.en_attente.lock().map_err(|e| e.to_string())?;
+    let imports: Option<Vec<ImportAEnregistrer>> = fichiers.as_ref().map(|list| {
+        list.iter()
+            .map(|f| ImportAEnregistrer { fichier: f, contenu: en_attente.get(&f.id).map(|p| p.contenu.clone()) })
+            .collect()
+    });
+    drop(en_attente);
+
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.save_bordereau(&bordereau).map_err(|e| e.to_string())
+    let id = db.save_bordereau(&bordereau, imports.as_deref())?;
+    drop(db);
+
+    if let Some(list) = fichiers {
+        let mut map = state.en_attente.lock().map_err(|e| e.to_string())?;
+        for f in list {
+            map.remove(&f.id);
+        }
+    }
+    Ok(id)
 }
 
 #[tauri::command]
 pub fn get_bordereaux(state: State<'_, AppState>) -> Result<Vec<Bordereau>, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.get_all_bordereaux().map_err(|e| e.to_string())
+    state.db.lock().map_err(|e| e.to_string())?.get_all_bordereaux()
 }
 
 #[tauri::command]
 pub fn get_bordereau(id: i64, state: State<'_, AppState>) -> Result<Option<Bordereau>, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.get_bordereau_by_id(id).map_err(|e| e.to_string())
+    state.db.lock().map_err(|e| e.to_string())?.get_bordereau_by_id(id)
+}
+
+#[tauri::command]
+pub fn update_bordereau_statut(id: i64, statut: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.db.lock().map_err(|e| e.to_string())?.update_bordereau_statut(id, &statut)
 }
 
 #[tauri::command]
 pub fn delete_bordereau(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    state.db.lock().map_err(|e| e.to_string())?.delete_bordereau(id)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pièces jointes / fichiers rattachés
+// ---------------------------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn add_piece_jointe(bordereau_id: i64, file_path: String, state: State<'_, AppState>) -> Result<i64, String> {
+    let bytes = fs::read(&file_path).map_err(|e| format!("Impossible de lire le fichier: {}", e))?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.delete_bordereau(id).map_err(|e| e.to_string())
+    db.add_piece_jointe(bordereau_id, &file_name_of(&file_path), &sha256_hex(&bytes), &bytes)
 }
 
 #[tauri::command]
-pub fn export_excel(bordereau: Bordereau, export_path: Option<String>) -> Result<String, String> {
-    let default_name = format!(
-        "Bordereau_{}_{}_{:02}_{}.xlsx",
-        bordereau.type_intermediaire,
-        bordereau.intermediaire_code,
-        bordereau.mois.unwrap_or(0),
-        bordereau.exercice
-    );
+pub fn add_piece_jointe_base64(
+    bordereau_id: i64,
+    file_name: String,
+    base64_data: String,
+    state: State<'_, AppState>,
+) -> Result<i64, String> {
+    let bytes = decode_base64_payload(&base64_data)?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.add_piece_jointe(bordereau_id, &file_name, &sha256_hex(&bytes), &bytes)
+}
 
-    let target_path = if let Some(p) = export_path {
-        PathBuf::from(p)
-    } else {
-        PathBuf::from(default_name)
+#[tauri::command]
+pub fn delete_piece_jointe(fichier_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    state.db.lock().map_err(|e| e.to_string())?.delete_piece_jointe(fichier_id)
+}
+
+fn safe_name(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect()
+}
+
+/// Extrait un fichier rattaché dans Exports/<numéro de bordereau>/ et l'ouvre avec l'application associée
+#[tauri::command]
+pub fn ouvrir_fichier(fichier_id: i64, state: State<'_, AppState>) -> Result<String, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let (nom, bordereau_id, contenu) = db.get_fichier_contenu(fichier_id)?;
+    let numero = db
+        .get_bordereau_by_id(bordereau_id)?
+        .map(|b| b.numero_bordereau)
+        .unwrap_or_else(|| format!("bordereau_{}", bordereau_id));
+    let dir = db.exports_directory().join(safe_name(&numero));
+    drop(db);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(safe_name(&nom));
+    fs::write(&path, contenu).map_err(|e| format!("Écriture impossible : {}", e))?;
+    tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| format!("Ouverture impossible : {}", e))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn export_excel(
+    bordereau: Bordereau,
+    export_path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let default_name = format!("Bordereau_{}.xlsx", safe_name(&bordereau.numero_bordereau));
+    // Par défaut dans le dossier "Exports" à côté de BDD (et non le répertoire courant,
+    // qui en mode dev est src-tauri et relancerait l'application via le watcher)
+    let target_path = match export_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            db.exports_directory().join(default_name)
+        }
     };
-
     ExcelExporter::export_bordereau_to_file(&bordereau, &target_path)
         .map_err(|e| format!("Erreur export Excel: {:?}", e))?;
-
     Ok(target_path.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_controles_contexte_import_avant_intermediaire() {
+        let Ok(bytes) = std::fs::read("../Import/05-2025.PDF") else { return };
+        let dir = std::env::temp_dir().join(format!("commissions_ctx_{}", std::process::id()));
+        let db = DatabaseManager::with_path(dir.join("BDD").join("commissions.db")).unwrap();
+        let known = db.known_sous_codes().unwrap();
+        let mut f = parse_file_auto_bytes(&bytes, "05-2025.PDF", None, &known).unwrap();
+        f.hash = sha256_hex(&bytes);
+        let nouvel = |code: &str, t: &str| {
+            db.save_intermediaire(&Intermediaire {
+                id: None,
+                type_intermediaire: t.to_string(),
+                code: code.to_string(),
+                nom: format!("INTER {}", code),
+                succursale: "S".to_string(),
+                departement: "D".to_string(),
+                contact: None,
+                adresse: None,
+                tva_applicable: 0.19,
+                actif: true,
+            })
+            .unwrap()
+        };
+        let aga = nouvel("492", "AGA");
+        let autre = nouvel("500", "AGA");
+        let ctx = |id: Option<i64>, mois: Option<i32>| ImportContext { intermediaire_id: id, exercice: 2025, mois, bordereau_id: None };
+
+        // Import sans intermédiaire : aucun contrôle bloquant de contexte
+        validate_against_context(&db, &mut f, &ctx(None, Some(5))).unwrap();
+        assert!(f.anomalies_contexte.is_empty());
+        // Bon intermédiaire (agence 492 du rapport) et bonne période
+        validate_against_context(&db, &mut f, &ctx(Some(aga), Some(5))).unwrap();
+        assert!(f.anomalies_contexte.is_empty(), "{:?}", f.anomalies_contexte);
+        // Mauvais intermédiaire et mauvais mois : signalés, puis effacés lors d'une nouvelle validation correcte
+        validate_against_context(&db, &mut f, &ctx(Some(autre), Some(6))).unwrap();
+        assert_eq!(f.anomalies_contexte.iter().filter(|a| a.est_bloquante()).count(), 2);
+        validate_against_context(&db, &mut f, &ctx(Some(aga), Some(5))).unwrap();
+        assert!(f.anomalies_contexte.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_auto_detection_des_pdf() {
+        let known = crate::parser::tests::known();
+        if let Ok(bytes) = std::fs::read("../Import/05-2025.PDF") {
+            let res = parse_file_auto_bytes(&bytes, "05-2025.PDF", None, &known).expect("parse CIRIS");
+            assert_eq!(res.file_type, "CIRIS_PDF");
+            assert_eq!(res.items.len(), 17);
+        }
+        if let Ok(bytes) = std::fs::read("../Import/RCCDVF.pdf") {
+            let res = parse_file_auto_bytes(&bytes, "RCCDVF.pdf", None, &known).expect("parse flotte");
+            assert_eq!(res.file_type, "FLOTTE_PDF");
+        }
+    }
 }
