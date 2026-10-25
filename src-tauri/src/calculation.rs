@@ -75,7 +75,13 @@ impl CalculationEngine {
         }
     }
 
-    pub fn compute_multi_bordereau(req: &CalculateMultiBordereauRequest, branches: &[BrancheParam]) -> Bordereau {
+    /// `deja_commissionnees` : polices déjà commissionnées dans d'autres bordereaux (N° normalisé -> bordereau),
+    /// qui ne sont pas recomptées.
+    pub fn compute_multi_bordereau(
+        req: &CalculateMultiBordereauRequest,
+        branches: &[BrancheParam],
+        deja_commissionnees: &HashMap<String, String>,
+    ) -> Bordereau {
         let mut anomalies: Vec<Anomalie> = Vec::new();
         let is_courtier = req.type_intermediaire == "COURTIER";
         // Regroupement "modèle officiel courtier" uniquement si le cumul par branche est demandé
@@ -84,12 +90,35 @@ impl CalculationEngine {
         let norm_police = |p: &str| p.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase();
 
         // 1. Chaque fichier est une source indépendante. Contrôle : une même police ne doit figurer que dans
-        //    un seul fichier ; si c'est le cas malgré tout, elle n'est comptée qu'une fois (premier fichier importé)
-        //    et l'anomalie est signalée.
+        //    un seul fichier ; si c'est le cas malgré tout, elle n'est comptée qu'une fois et c'est signalé.
+        //    Une police présente dans un PDF de flotte est prise dans ce PDF (ventilation par garantie : RC,
+        //    assistance, dommages…) ; les informations de la ligne du registre (dates, CP, TTC) y sont reprises.
         let mut premier_fichier: HashMap<String, String> = HashMap::new();
+        let mut total_police: HashMap<(String, String), f64> = HashMap::new();
+        let mut infos_registre: HashMap<String, &ExtractedItem> = HashMap::new();
         for file in &req.files {
-            for p in file.items.iter().filter_map(|i| i.police.as_deref()).map(norm_police).filter(|p| !p.is_empty()) {
-                premier_fichier.entry(p).or_insert_with(|| file.file_name.clone());
+            for it in &file.items {
+                let p = match it.police.as_deref().map(norm_police).filter(|p| !p.is_empty()) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                *total_police.entry((p.clone(), file.file_name.clone())).or_insert(0.0) += it.prime_nette;
+                if file.file_type == "EXCEL_PRODUCTION" {
+                    infos_registre.entry(p.clone()).or_insert(it);
+                }
+                let prefere_flotte = file.file_type == "FLOTTE_PDF";
+                match premier_fichier.get(&p) {
+                    None => {
+                        premier_fichier.insert(p, file.file_name.clone());
+                    }
+                    Some(actuel) if prefere_flotte && actuel != &file.file_name => {
+                        let actuel_flotte = req.files.iter().any(|f| &f.file_name == actuel && f.file_type == "FLOTTE_PDF");
+                        if !actuel_flotte {
+                            premier_fichier.insert(p, file.file_name.clone());
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         // (police, fichier retenu, fichier écarté) -> (lignes écartées, montant écarté)
@@ -114,9 +143,21 @@ impl CalculationEngine {
         let mut groups: HashMap<String, Acc> = HashMap::new();
         let mut seq = 0usize;
 
+        // bordereau -> (polices, montant, exemples)
+        let mut deja: std::collections::BTreeMap<String, (std::collections::BTreeSet<String>, f64)> = std::collections::BTreeMap::new();
+
         for file in &req.files {
             for item in &file.items {
+                // Double facturation : police déjà facturée dans un autre bordereau. Elle reste visible dans ce
+                // bordereau, verrouillée et non comptée (exclue), avec l'origine de la première facturation.
+                let mut deja_facturee: Option<String> = None;
                 if let Some(p) = item.police.as_deref().map(norm_police).filter(|p| !p.is_empty()) {
+                    if let Some(num) = deja_commissionnees.get(&p) {
+                        let e = deja.entry(num.clone()).or_default();
+                        e.0.insert(item.police.clone().unwrap_or_default());
+                        e.1 += item.prime_nette;
+                        deja_facturee = Some(num.clone());
+                    }
                     if let Some(retenu) = premier_fichier.get(&p) {
                         if retenu != &file.file_name {
                             let e = ecartees.entry((p, retenu.clone(), file.file_name.clone())).or_insert((0, 0.0));
@@ -236,24 +277,52 @@ impl CalculationEngine {
 
                 let entry = groups.entry(key).or_insert(acc);
                 entry.prime_nette += item.prime_nette;
+                // Informations de la police : celles de la ligne elle-même, à défaut celles du registre
+                let registre = item.police.as_deref().map(norm_police).and_then(|p| infos_registre.get(&p).copied());
+                let src = |a: &Option<String>, b: Option<&Option<String>>| a.clone().or_else(|| b.and_then(|x| x.clone()));
                 entry.contributions.push(LigneContribution {
                     fichier_source: item.fichier_source.clone(),
                     police: item.police.clone(),
-                    client: item.client_nom.clone(),
+                    client: item.client_nom.clone().or_else(|| registre.and_then(|r| r.client_nom.clone())),
                     montant: item.prime_nette,
-                    exclue: false,
+                    exclue: deja_facturee.is_some(),
+                    deja_facturee: deja_facturee.clone(),
+                    garantie: Some(code.clone()),
+                    client_code: src(&item.client_code, registre.map(|r| &r.client_code)),
+                    branche: Some(registre.map(|r| r.branche_code.clone()).unwrap_or_else(|| item.branche_code.clone()))
+                        .filter(|b| !b.is_empty()),
+                    date_emission: src(&item.date_emission, registre.map(|r| &r.date_emission)),
+                    date_effet: src(&item.date_effet, registre.map(|r| &r.date_effet)),
+                    date_echeance: src(&item.date_echeance, registre.map(|r| &r.date_echeance)),
+                    cp: item.cp.or_else(|| registre.and_then(|r| r.cp)),
+                    prime_ttc: if item.source_type == "BRANCHE_IMPORT" { item.prime_ttc } else { registre.and_then(|r| r.prime_ttc) },
                 });
             }
         }
 
         for ((police, retenu, ecarte), (n, montant)) in &ecartees {
+            let retenu_total = total_police.get(&(police.clone(), retenu.clone())).copied().unwrap_or(0.0);
+            let ecart = Self::round_cents(retenu_total - montant);
             anomalies.push(Anomalie::avertissement(format!(
-                "Police {} présente dans deux fichiers : comptée une seule fois (« {} ») ; {} ligne(s) de « {} » ({} DZD) non comptée(s).",
+                "Police {} présente dans deux fichiers : comptée une seule fois (« {} », {} DZD) ; {} ligne(s) de « {} » ({} DZD) non comptée(s){}.",
                 police,
                 retenu,
+                fmt2(Self::round_cents(retenu_total)),
                 n,
                 ecarte,
-                fmt2(Self::round_cents(*montant))
+                fmt2(Self::round_cents(*montant)),
+                if ecart.abs() >= 0.01 { format!(" — écart entre les deux fichiers : {} DZD", fmt2(ecart)) } else { String::new() }
+            )));
+        }
+
+        for (numero, (polices, montant)) in &deja {
+            anomalies.push(Anomalie::avertissement(format!(
+                "Double facturation : {} police(s) déjà facturée(s) — {} — verrouillée(s) et non refacturée(s) ({} DZD). Ex. : {}{}",
+                polices.len(),
+                numero,
+                fmt2(Self::round_cents(*montant)),
+                polices.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+                if polices.len() > 5 { "…" } else { "" }
             )));
         }
 
@@ -356,6 +425,7 @@ impl CalculationEngine {
             lignes,
             anomalies,
             fichiers: Vec::new(),
+            facture: None,
         };
         Self::recompute_bordereau(&mut bordereau);
         bordereau

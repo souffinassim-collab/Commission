@@ -1,13 +1,18 @@
 import {
   BrancheParam,
+  Categorie,
   Intermediaire,
   Bordereau,
   DbInfo,
   ExcelScanResult,
+  ExcelClientSummary,
+  ExcelSelection,
   UploadedFileResult,
   ImportContext,
   CalculateMultiBordereauRequest,
   StatutBordereau,
+  DetailProduction,
+  FactureIntermediaire,
 } from '../types';
 
 // Vérification de l'environnement Tauri
@@ -36,6 +41,12 @@ export const api = {
   saveBranche: (branche: BrancheParam) => invokeTauri<number>('save_branche', { branche }),
   deleteBranche: (id: number) => invokeTauri<void>('delete_branche', { id }),
   resetBranchesToDefault: () => invokeTauri<BrancheParam[]>('reset_branches_to_default'),
+  // Catégories de paramètres
+  getCategories: () => invokeTauri<Categorie[]>('get_categories'),
+  saveCategorie: (categorie: Categorie) => invokeTauri<number>('save_categorie', { categorie }),
+  deleteCategorie: (id: number) => invokeTauri<void>('delete_categorie', { id }),
+  affecterCategorie: (brancheIds: number[], categorieId: number | null) =>
+    invokeTauri<void>('affecter_categorie', { brancheIds, categorieId }),
 
   // Intermédiaires
   getIntermediaires: () => invokeTauri<Intermediaire[]>('get_intermediaires'),
@@ -43,13 +54,19 @@ export const api = {
   deleteIntermediaire: (id: number) => invokeTauri<void>('delete_intermediaire', { id }),
 
   // Import
-  scanExcelClients: (filePath: string) => invokeTauri<ExcelScanResult>('scan_excel_clients', { filePath }),
-  scanExcelClientsBase64: (base64Data: string, fileName: string) =>
-    invokeTauri<ExcelScanResult>('scan_excel_clients_base64', { base64Data, fileName }),
-  parseFileAuto: (filePath: string, ctx: ImportContext, clientFilter?: string) =>
-    invokeTauri<UploadedFileResult>('parse_file_auto', { filePath, clientFilter, ctx }),
-  parseFileAutoBase64: (base64Data: string, fileName: string, ctx: ImportContext, clientFilter?: string) =>
-    invokeTauri<UploadedFileResult>('parse_file_auto_base64', { base64Data, fileName, clientFilter, ctx }),
+  // Registre Excel : analyse (points de vente), clients d'un point de vente, import de la sélection
+  analyserClasseur: (filePath: string) => invokeTauri<ExcelScanResult>('analyser_classeur', { filePath }),
+  analyserClasseurBase64: (base64Data: string, fileName: string) =>
+    invokeTauri<ExcelScanResult>('analyser_classeur_base64', { base64Data, fileName }),
+  clientsPointVente: (stagingId: string, pointVente: string) =>
+    invokeTauri<ExcelClientSummary[]>('clients_point_vente', { stagingId, pointVente }),
+  importerClasseur: (stagingId: string, selection: ExcelSelection, ctx: ImportContext) =>
+    invokeTauri<UploadedFileResult>('importer_classeur', { stagingId, selection, ctx }),
+  // PDF (rapport CIRIS, flotte)
+  parseFileAuto: (filePath: string, ctx: ImportContext) =>
+    invokeTauri<UploadedFileResult>('parse_file_auto', { filePath, ctx }),
+  parseFileAutoBase64: (base64Data: string, fileName: string, ctx: ImportContext) =>
+    invokeTauri<UploadedFileResult>('parse_file_auto_base64', { base64Data, fileName, ctx }),
   clearPendingFiles: (ids: string[]) => invokeTauri<void>('clear_pending_files', { ids }),
   revaliderFichiers: (fichiers: UploadedFileResult[], ctx: ImportContext) =>
     invokeTauri<UploadedFileResult[]>('revalider_fichiers', { fichiers, ctx }),
@@ -74,6 +91,12 @@ export const api = {
     invokeTauri<number>('add_piece_jointe_base64', { bordereauId, fileName, base64Data }),
   deletePieceJointe: (fichierId: number) => invokeTauri<void>('delete_piece_jointe', { fichierId }),
   ouvrirFichier: (fichierId: number) => invokeTauri<string>('ouvrir_fichier', { fichierId }),
+
+  // Détail de production : facture de l'intermédiaire, rapprochement et écarts
+  detailProduction: (bordereau: Bordereau) => invokeTauri<DetailProduction>('detail_production', { bordereau }),
+  enregistrerFactureIntermediaire: (bordereauId: number, facture?: FactureIntermediaire) =>
+    invokeTauri<void>('enregistrer_facture_intermediaire', { bordereauId, facture: facture ?? null }),
+  exportDetailProduction: (bordereau: Bordereau) => invokeTauri<string>('export_detail_production', { bordereau }),
 };
 
 /** Lit un fichier local (navigateur) en data-URL base64 */

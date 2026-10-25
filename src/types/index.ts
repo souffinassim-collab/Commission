@@ -15,6 +15,17 @@ export interface BrancheParam {
   /** Libellé de la ligne cumulée du bordereau courtier (ex: "RC AUTOMOBILE") */
   groupe_bordereau: string;
   ordre_bordereau: number;
+  /** Catégorie d'affichage (aucune = « Sans catégorie ») */
+  categorie_id?: number | null;
+}
+
+/** Catégorie de paramètres (regroupement d'affichage géré par l'utilisateur) */
+export interface Categorie {
+  id?: number;
+  libelle: string;
+  ordre: number;
+  /** Nombre de lignes rattachées (lecture seule) */
+  nb_branches?: number;
 }
 
 export interface Intermediaire {
@@ -45,6 +56,84 @@ export interface LigneContribution {
   montant: number;
   /** Police exclue par le commercial (ex: prime non encaissée) : non commissionnée */
   exclue?: boolean;
+  client_code?: string;
+  branche?: string;
+  date_emission?: string;
+  date_effet?: string;
+  date_echeance?: string;
+  cp?: number;
+  prime_ttc?: number;
+  /** Police déjà facturée dans un autre bordereau (origine) : verrouillée, non comptée */
+  deja_facturee?: string;
+}
+
+/** Facture de l'intermédiaire saisie pour confirmation (commission HT déclarée par ligne du bordereau) */
+export interface FactureIntermediaire {
+  numero: string;
+  date: string;
+  commentaire: string;
+  /** clé : code|libellé|branche de la ligne */
+  montants_ht: Record<string, number>;
+}
+
+export interface PoliceDetail {
+  exercice: number;
+  police: string;
+  branche: string;
+  client?: string;
+  date_emission?: string;
+  date_effet?: string;
+  date_echeance?: string;
+  prime_nette: number;
+  ventilation: (number | null)[];
+  cp?: number;
+  prime_ttc?: number;
+}
+
+export interface LigneRapprochement {
+  cle: string;
+  libelle: string;
+  prime_nette: number;
+  taux: number;
+  com_ht_calculee: number;
+  com_ht_declaree?: number | null;
+  ecart?: number | null;
+}
+
+/** « Détail de production » à confirmer : détail par police, rapprochement calcul / facture, écarts */
+export interface DetailProduction {
+  succursale: string;
+  departement: string;
+  type_intermediaire: string;
+  intermediaire: string;
+  clients: string[];
+  exercice: number;
+  mois?: number;
+  numero_bordereau: string;
+  colonnes_ventilation: string[];
+  polices: PoliceDetail[];
+  total_prime_nette: number;
+  total_ventilation: number[];
+  total_cp: number;
+  total_prime_ttc: number;
+  lignes: LigneRapprochement[];
+  total_prime_lignes: number;
+  controle: number;
+  tva_taux: number;
+  ht_calcule: number;
+  tva_calculee: number;
+  ttc_calcule: number;
+  facture_saisie: boolean;
+  facture_numero: string;
+  facture_date: string;
+  ht_declare: number;
+  tva_declaree: number;
+  ttc_declare: number;
+  ecart_ht: number;
+  ecart_tva: number;
+  ecart_ttc: number;
+  lignes_non_saisies: number;
+  polices_exclues: [string, string, number][];
 }
 
 export interface BordereauLigne {
@@ -85,6 +174,7 @@ export interface FichierBordereau {
   total_prime_nette: number;
   nb_lignes: number;
   anomalies: Anomalie[];
+  selection?: string;
 }
 
 export interface Bordereau {
@@ -111,6 +201,8 @@ export interface Bordereau {
   lignes: BordereauLigne[];
   anomalies?: Anomalie[];
   fichiers?: FichierBordereau[];
+  /** Facture de l'intermédiaire saisie pour confirmation */
+  facture?: FactureIntermediaire;
 }
 
 export interface ExtractedItem {
@@ -144,6 +236,12 @@ export interface UploadedFileResult {
   taille: number;
   exercice?: number;
   mois?: number;
+  /** Registre Excel : point de vente retenu */
+  point_vente?: string;
+  /** Registre Excel : clients retenus (affaires d'un courtier) */
+  clients_selectionnes?: string[];
+  /** Description de la sélection faite dans le fichier */
+  selection?: string;
 }
 
 export interface ExcelClientSummary {
@@ -153,11 +251,30 @@ export interface ExcelClientSummary {
   total_prime_nette: number;
 }
 
+/** Point de vente d'un registre de production (préfixe du N° de police = code de l'agence / AGA) */
+export interface PointVenteSummary {
+  code: string;
+  nombre_polices: number;
+  nombre_clients: number;
+  total_prime_nette: number;
+  branches: string[];
+}
+
 export interface ExcelScanResult {
+  /** Identifiant du classeur conservé par l'application le temps de la sélection */
+  staging_id: string;
   file_name: string;
-  clients: ExcelClientSummary[];
   total_lignes: number;
-  multiple_clients: boolean;
+  points_vente: PointVenteSummary[];
+  /** Informations de l'export CIRIS (agence, période d'extraction) */
+  info_export: string[];
+  periode_emission?: string;
+}
+
+/** Sélection dans un registre : un point de vente, et éventuellement les clients apportés par un courtier */
+export interface ExcelSelection {
+  point_vente?: string;
+  clients: string[];
 }
 
 /** Contexte d'import : chaque fichier est rattaché à l'intermédiaire et à la période du bordereau */
@@ -171,6 +288,8 @@ export interface ImportContext {
 
 export interface CalculateMultiBordereauRequest {
   files: UploadedFileResult[];
+  /** Bordereau en cours de modification (ses propres polices ne sont pas des doublons) */
+  bordereau_id?: number;
   intermediaire_id?: number;
   type_intermediaire: IntermediaireType;
   intermediaire_code: string;

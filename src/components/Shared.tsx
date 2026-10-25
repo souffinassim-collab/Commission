@@ -56,7 +56,8 @@ export const appliquerPolicesExclues = (lignes: BordereauLigne[], exclues: Set<s
     ...l,
     contributions: (l.contributions || []).map((c) => ({
       ...c,
-      exclue: !!c.police && exclues.has(policeKey(c.fichier_source, c.police)),
+      // Une police déjà facturée ailleurs reste exclue, quoi qu'il arrive (double facturation interdite)
+      exclue: !!c.deja_facturee || (!!c.police && exclues.has(policeKey(c.fichier_source, c.police))),
     })),
   }));
 
@@ -69,7 +70,43 @@ export interface PoliceResume {
   montant: number;
   nbGaranties: number;
   exclue: boolean;
+  /** Déjà facturée dans un autre bordereau (origine) : verrouillée */
+  dejaFacturee?: string;
 }
+
+/** Polices déjà facturées dans un autre bordereau, avec l'origine de la première facturation */
+export const policesDejaFacturees = (lignes: BordereauLigne[]): PoliceResume[] =>
+  listerPolices(lignes).filter((p) => !!p.dejaFacturee);
+
+/** Alerte « Double facturation » : polices déjà facturées, verrouillées et non comptées */
+export const AlerteDoubleFacturation: React.FC<{ lignes: BordereauLigne[] }> = ({ lignes }) => {
+  const polices = policesDejaFacturees(lignes);
+  if (!polices.length) return null;
+  const parOrigine = new Map<string, PoliceResume[]>();
+  for (const p of polices) parOrigine.set(p.dejaFacturee!, [...(parOrigine.get(p.dejaFacturee!) || []), p]);
+  const total = round2(polices.reduce((s, p) => s + p.montant, 0));
+  const fmt = (v: number) => v.toLocaleString('fr-DZ', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (
+    <div className="bg-rose-50 border-2 border-rose-400 rounded-2xl p-4 space-y-2 text-xs text-rose-950 no-print">
+      <div className="flex items-center gap-2 font-black text-sm">
+        <Ban className="w-5 h-5 text-rose-600" /> Double facturation bloquée : {polices.length} police(s) déjà facturée(s)
+      </div>
+      <p>
+        Ces polices ont déjà été facturées dans un autre bordereau. Elles sont <strong>verrouillées et non comptées</strong> ({fmt(total)} DZD de
+        prime) : elles ne peuvent pas être refacturées.
+      </p>
+      {[...parOrigine.entries()].map(([origine, ps]) => (
+        <div key={origine} className="bg-white/70 border border-rose-200 rounded-lg p-2">
+          <div className="font-bold">Déjà facturée(s) — {origine}</div>
+          <div className="font-mono text-[11px] text-rose-800 break-words">
+            {ps.slice(0, 30).map((p) => p.police).join(' • ')}
+            {ps.length > 30 && ` … (+${ps.length - 30})`}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+};
 
 export const listerPolices = (lignes: BordereauLigne[]): PoliceResume[] => {
   const map = new Map<string, PoliceResume>();
@@ -85,10 +122,12 @@ export const listerPolices = (lignes: BordereauLigne[]): PoliceResume[] => {
         montant: 0,
         nbGaranties: 0,
         exclue: true,
+        dejaFacturee: c.deja_facturee,
       };
       p.montant = round2(p.montant + c.montant);
       p.nbGaranties += 1;
       p.exclue = p.exclue && !!c.exclue;
+      p.dejaFacturee = p.dejaFacturee || c.deja_facturee;
       map.set(key, p);
     }
   }
@@ -108,7 +147,9 @@ export const PolicesPanel: React.FC<{
   const [filtre, setFiltre] = React.useState<'TOUTES' | 'EXCLUES'>('TOUTES');
   const polices = listerPolices(lignes);
   if (!polices.length) return null;
-  const exclues = polices.filter((p) => p.exclue);
+  // Les polices déjà facturées ailleurs sont verrouillées : elles ne comptent pas parmi les « non encaissées »
+  const exclues = polices.filter((p) => p.exclue && !p.dejaFacturee);
+  const verrouillees = polices.filter((p) => p.dejaFacturee);
   const montantExclu = round2(exclues.reduce((s, p) => s + p.montant, 0));
   const ql = q.toLowerCase();
   const visibles = polices.filter(
@@ -126,6 +167,11 @@ export const PolicesPanel: React.FC<{
         ) : (
           <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-200 text-[10px]">
             toutes commissionnées
+          </span>
+        )}
+        {verrouillees.length > 0 && (
+          <span className="px-2 py-0.5 rounded bg-rose-600 text-white text-[10px]">
+            {verrouillees.length} déjà facturée(s) — verrouillée(s)
           </span>
         )}
       </summary>
@@ -172,10 +218,18 @@ export const PolicesPanel: React.FC<{
                   {p.client && `${p.client} • `}
                   {p.fichier} • {p.nbGaranties} garantie(s)
                 </div>
+                {p.dejaFacturee && <div className="text-[10px] font-bold text-rose-700">Déjà facturée — {p.dejaFacturee}</div>}
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 <span className={`font-mono font-bold ${p.exclue ? 'line-through text-slate-400' : ''}`}>{fmt(p.montant)}</span>
-                {readOnly ? (
+                {p.dejaFacturee ? (
+                  <span
+                    className="px-2 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 bg-rose-100 text-rose-800 border border-rose-300 cursor-not-allowed"
+                    title={`Déjà facturée — ${p.dejaFacturee} : refacturation interdite`}
+                  >
+                    <Ban className="w-3 h-3" /> Déjà facturée
+                  </span>
+                ) : readOnly ? (
                   <span className={`text-[10px] font-bold ${p.exclue ? 'text-rose-700' : 'text-emerald-700'}`}>
                     {p.exclue ? 'Non encaissée (exclue)' : 'Commissionnée'}
                   </span>

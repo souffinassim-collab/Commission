@@ -15,10 +15,15 @@ import {
   RotateCcw,
   BadgeCheck,
   Lock,
+  Pencil,
+  Plus,
+  X,
 } from 'lucide-react';
 import { Bordereau, FichierBordereau, StatutBordereau } from '../types';
+import { DetailProductionView } from '../components/DetailProduction';
 import { api, errMsg, formatDZD, formatMontant, readFileAsDataUrl } from '../lib/api';
 import {
+  AlerteDoubleFacturation,
   AnomaliesBadges,
   AnomaliesPanel,
   ConfirmDialog,
@@ -37,10 +42,23 @@ const FILE_TYPE_LABEL: Record<string, string> = {
 
 const taille = (n: number) => (n > 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} Mo` : `${Math.max(1, Math.round(n / 1024))} Ko`);
 
-export const BordereauxPage: React.FC = () => {
+interface EditionState {
+  b: Bordereau;
+  numeroFacture: string;
+  dateFacture: string;
+  succursale: string;
+  departement: string;
+  codeClient: string;
+  statut: StatutBordereau;
+}
+
+export const BordereauxPage: React.FC<{ onNouveau?: () => void }> = ({ onNouveau }) => {
+  const [edition, setEdition] = useState<EditionState | null>(null);
+  const [savingEdition, setSavingEdition] = useState(false);
   const [bordereaux, setBordereaux] = useState<Bordereau[]>([]);
   const [selected, setSelected] = useState<Bordereau | null>(null);
   const [modifie, setModifie] = useState<boolean>(false);
+  const [vue, setVue] = useState<'bordereau' | 'detail'>('bordereau');
   const [loading, setLoading] = useState<boolean>(true);
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [filterType, setFilterType] = useState<string>('ALL');
@@ -157,7 +175,7 @@ export const BordereauxPage: React.FC = () => {
     const lignes = selected.lignes.map((l) => ({
       ...l,
       contributions: (l.contributions || []).map((c) =>
-        c.police && set.has(policeKey(c.fichier_source, c.police)) ? { ...c, exclue } : c
+        c.police && !c.deja_facturee && set.has(policeKey(c.fichier_source, c.police)) ? { ...c, exclue } : c
       ),
     }));
     setSelected(recomputeTotals(selected, lignes));
@@ -227,10 +245,155 @@ export const BordereauxPage: React.FC = () => {
     });
   };
 
+  // --- Modification (Update) : facture, en-tête du bordereau (brouillon), statut ---
+  const ouvrirEdition = (b: Bordereau) =>
+    setEdition({
+      b,
+      numeroFacture: b.facture?.numero || '',
+      dateFacture: b.facture?.date || '',
+      succursale: b.succursale,
+      departement: b.departement,
+      codeClient: b.code_client || '',
+      statut: b.statut,
+    });
+
+  const enregistrerEdition = async () => {
+    if (!edition?.b.id) return;
+    const e = edition;
+    const id = e.b.id!;
+    setSavingEdition(true);
+    try {
+      // 1. En-tête (brouillon uniquement) : les lignes, taux et fichiers restent ceux enregistrés
+      const enteteModifie =
+        e.succursale.trim() !== e.b.succursale || e.departement.trim() !== e.b.departement || e.codeClient.trim() !== (e.b.code_client || '');
+      if (enteteModifie && e.b.statut === 'BROUILLON') {
+        const full = await api.getBordereau(id);
+        if (!full) throw new Error('Bordereau introuvable');
+        await api.saveBordereau({
+          ...full,
+          succursale: e.succursale.trim(),
+          departement: e.departement.trim(),
+          code_client: e.codeClient.trim() || undefined,
+        });
+      }
+      // 2. Facture de l'intermédiaire (montants déjà saisis conservés)
+      if (e.numeroFacture.trim() !== (e.b.facture?.numero || '') || e.dateFacture.trim() !== (e.b.facture?.date || '')) {
+        await api.enregistrerFactureIntermediaire(id, {
+          numero: e.numeroFacture.trim(),
+          date: e.dateFacture.trim(),
+          commentaire: e.b.facture?.commentaire || '',
+          montants_ht: e.b.facture?.montants_ht || {},
+        });
+      }
+      // 3. Statut (transitions contrôlées par l'application)
+      if (e.statut !== e.b.statut) await api.updateBordereauStatut(id, e.statut);
+      setEdition(null);
+      setMessage({ type: 'success', text: `Bordereau ${e.b.numero_bordereau} mis à jour.` });
+      await loadBordereaux();
+      if (selected?.id === id) await reload(id);
+    } catch (err) {
+      setMessage({ type: 'error', text: `Modification refusée : ${errMsg(err)}` });
+    } finally {
+      setSavingEdition(false);
+    }
+  };
+
+  const editionModal = edition && (
+    <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4 no-print">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden text-xs">
+        <div className="px-6 py-4 flex items-center justify-between bg-gradient-to-r from-indigo-900 to-slate-900 text-white">
+          <div className="font-bold text-sm">Modifier — {edition.b.numero_bordereau}</div>
+          <button onClick={() => setEdition(null)} className="cursor-pointer">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <div className="p-6 space-y-3">
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block">
+              <span className="font-bold text-slate-700">N° de facture</span>
+              <input
+                value={edition.numeroFacture}
+                disabled={edition.b.statut === 'REGLE'}
+                onChange={(ev) => setEdition({ ...edition, numeroFacture: ev.target.value })}
+                className="w-full border border-slate-200 rounded-lg p-2 mt-1 font-mono"
+              />
+            </label>
+            <label className="block">
+              <span className="font-bold text-slate-700">Date de facture</span>
+              <input
+                value={edition.dateFacture}
+                placeholder="JJ/MM/AAAA"
+                disabled={edition.b.statut === 'REGLE'}
+                onChange={(ev) => setEdition({ ...edition, dateFacture: ev.target.value })}
+                className="w-full border border-slate-200 rounded-lg p-2 mt-1"
+              />
+            </label>
+            <label className="block">
+              <span className="font-bold text-slate-700">Succursale</span>
+              <input
+                value={edition.succursale}
+                disabled={edition.b.statut !== 'BROUILLON'}
+                onChange={(ev) => setEdition({ ...edition, succursale: ev.target.value })}
+                className="w-full border border-slate-200 rounded-lg p-2 mt-1"
+              />
+            </label>
+            <label className="block">
+              <span className="font-bold text-slate-700">Département</span>
+              <input
+                value={edition.departement}
+                disabled={edition.b.statut !== 'BROUILLON'}
+                onChange={(ev) => setEdition({ ...edition, departement: ev.target.value })}
+                className="w-full border border-slate-200 rounded-lg p-2 mt-1"
+              />
+            </label>
+            <label className="block">
+              <span className="font-bold text-slate-700">Code client</span>
+              <input
+                value={edition.codeClient}
+                disabled={edition.b.statut !== 'BROUILLON'}
+                onChange={(ev) => setEdition({ ...edition, codeClient: ev.target.value })}
+                className="w-full border border-slate-200 rounded-lg p-2 mt-1"
+              />
+            </label>
+            <label className="block">
+              <span className="font-bold text-slate-700">Statut</span>
+              <select
+                value={edition.statut}
+                onChange={(ev) => setEdition({ ...edition, statut: ev.target.value as StatutBordereau })}
+                className="w-full border border-slate-200 rounded-lg p-2 mt-1"
+              >
+                <option value="BROUILLON">Brouillon</option>
+                <option value="VALIDE">Validé</option>
+                <option value="REGLE">Réglé</option>
+              </select>
+            </label>
+          </div>
+          <p className="text-[11px] text-slate-500">
+            Les lignes, taux et montants ne se modifient pas ici : ils restent ceux du calcul enregistré (ouvrez le bordereau
+            pour exclure des lignes ou des polices). Succursale, département et code client : brouillon uniquement.
+          </p>
+        </div>
+        <div className="px-6 py-3 bg-slate-50 border-t border-slate-100 flex justify-end gap-2">
+          <button onClick={() => setEdition(null)} className="px-4 py-2 rounded-xl bg-white border border-slate-300 font-bold cursor-pointer">
+            Annuler
+          </button>
+          <button
+            onClick={enregistrerEdition}
+            disabled={savingEdition}
+            className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-bold cursor-pointer flex items-center gap-1.5"
+          >
+            <Save className="w-3.5 h-3.5" /> {savingEdition ? 'Enregistrement…' : 'Enregistrer'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
   const filtered = bordereaux.filter((b) => {
     const q = searchTerm.toLowerCase();
     const matchSearch =
       b.numero_bordereau.toLowerCase().includes(q) ||
+      (b.facture?.numero || '').toLowerCase().includes(q) ||
       b.intermediaire_nom.toLowerCase().includes(q) ||
       b.intermediaire_code.toLowerCase().includes(q);
     return matchSearch && (filterType === 'ALL' || b.type_intermediaire === filterType) && (filterStatut === 'ALL' || b.statut === filterStatut);
@@ -302,13 +465,43 @@ export const BordereauxPage: React.FC = () => {
           </div>
         </div>
         {msgBox}
-        {!editable && (
+        <div className="flex gap-2 no-print max-w-6xl mx-auto">
+          {(
+            [
+              ['bordereau', 'Bordereau officiel'],
+              ['detail', `Détail de production / facture ${courtier ? 'du courtier' : 'de l’AGA'}`],
+            ] as const
+          ).map(([v, label]) => (
+            <button
+              key={v}
+              type="button"
+              onClick={() => setVue(v)}
+              className={`px-4 py-2 rounded-xl text-xs font-bold border cursor-pointer ${
+                vue === v ? 'bg-indigo-600 border-indigo-600 text-white' : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              {label}
+              {v === 'detail' && b.facture && <span className="ml-1.5 text-[10px] opacity-80">(facture saisie)</span>}
+            </button>
+          ))}
+        </div>
+        {vue === 'detail' && (
+          <DetailProductionView
+            key={b.id}
+            bordereau={b}
+            modifiable={!!b.id && b.statut !== 'REGLE'}
+            onSaved={() => reload(b.id!)}
+            onMessage={setMessage}
+          />
+        )}
+        {vue === 'bordereau' && !editable && (
           <div className="p-3 rounded-xl bg-slate-100 border border-slate-200 text-slate-700 text-xs flex items-center gap-2 no-print">
             <Lock className="w-4 h-4" /> Bordereau {b.statut === 'VALIDE' ? 'validé' : 'réglé'} : lecture seule. Les taux et montants affichés sont ceux enregistrés.
           </div>
         )}
 
         {/* Feuille officielle */}
+        {vue === 'bordereau' && (
         <div className="bg-white p-8 md:p-12 rounded-2xl border border-slate-200 shadow-sm print:shadow-none print:border-none print:p-0 max-w-5xl mx-auto">
           <div className="border-b-2 border-slate-900 pb-4 mb-6">
             <div className="flex justify-between items-start">
@@ -425,8 +618,10 @@ export const BordereauxPage: React.FC = () => {
             ))}
           </div>
         </div>
+        )}
 
         <div className="max-w-5xl mx-auto">
+          <AlerteDoubleFacturation lignes={b.lignes} />
           <PolicesPanel lignes={b.lignes} readOnly={!editable} onToggle={togglePolices} />
         </div>
 
@@ -456,6 +651,7 @@ export const BordereauxPage: React.FC = () => {
                       {f.client_nom && `${f.client_nom} `}
                       {f.periode && `• ${f.periode} `}• {f.nb_lignes} lignes • {taille(f.taille)} • ajouté le {f.date_ajout}
                     </span>
+                    {f.selection && <span className="text-indigo-700 font-semibold">{f.selection}</span>}
                   </span>
                   <span className="flex items-center gap-2 shrink-0">
                     <span className="font-mono font-bold">{formatDZD(f.total_prime_nette)}</span>
@@ -502,6 +698,7 @@ export const BordereauxPage: React.FC = () => {
             </details>
           )}
         </div>
+        {editionModal}
         <ConfirmDialog state={confirm} onClose={() => setConfirm(null)} />
       </div>
     );
@@ -521,7 +718,7 @@ export const BordereauxPage: React.FC = () => {
             <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
             <input
               type="text"
-              placeholder="Numéro, nom, code…"
+              placeholder="N° facture, bordereau, nom, code…"
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               className="pl-9 pr-4 py-2 bg-white border border-slate-200 rounded-lg text-xs font-medium w-56"
@@ -538,6 +735,14 @@ export const BordereauxPage: React.FC = () => {
             <option value="VALIDE">Validés</option>
             <option value="REGLE">Réglés</option>
           </select>
+          {onNouveau && (
+            <button
+              onClick={onNouveau}
+              className="px-3.5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+            >
+              <Plus className="w-4 h-4" /> Nouveau bordereau
+            </button>
+          )}
         </div>
       </div>
       {msgBox}
@@ -547,7 +752,7 @@ export const BordereauxPage: React.FC = () => {
           <table className="w-full text-left text-xs">
             <thead>
               <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider">
-                <th className="px-4 py-3">Numéro</th>
+                <th className="px-4 py-3">N° Facture</th>
                 <th className="px-4 py-3">Intermédiaire</th>
                 <th className="px-4 py-3">Type</th>
                 <th className="px-4 py-3 text-center">Période</th>
@@ -572,7 +777,15 @@ export const BordereauxPage: React.FC = () => {
               ) : (
                 filtered.map((b) => (
                   <tr key={b.id} className="hover:bg-slate-50/80">
-                    <td className="px-4 py-3 font-mono font-bold text-indigo-600">{b.numero_bordereau}</td>
+                    <td className="px-4 py-3">
+                      {b.facture?.numero ? (
+                        <div className="font-mono font-bold text-indigo-700">{b.facture.numero}</div>
+                      ) : (
+                        <div className="text-[11px] font-semibold text-amber-700">Facture à saisir</div>
+                      )}
+                      {b.facture?.date && <div className="text-[10px] text-slate-500">du {b.facture.date}</div>}
+                      <div className="text-[10px] text-slate-400 font-mono">{b.numero_bordereau}</div>
+                    </td>
                     <td className="px-4 py-3">
                       <div className="font-bold text-slate-900">{b.intermediaire_nom}</div>
                       <div className="text-[10px] text-slate-400 font-mono">Code : {b.intermediaire_code}</div>
@@ -592,6 +805,9 @@ export const BordereauxPage: React.FC = () => {
                       <div className="flex items-center justify-center gap-1.5">
                         <button onClick={() => handleView(b.id!)} title="Ouvrir" className="p-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 cursor-pointer">
                           <Eye className="w-3.5 h-3.5" />
+                        </button>
+                        <button onClick={() => ouvrirEdition(b)} title="Modifier" className="p-1.5 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-700 cursor-pointer">
+                          <Pencil className="w-3.5 h-3.5" />
                         </button>
                         <button onClick={() => handleExportExcel(b)} title="Exporter Excel" className="p-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 cursor-pointer">
                           <FileSpreadsheet className="w-3.5 h-3.5" />
@@ -613,6 +829,7 @@ export const BordereauxPage: React.FC = () => {
           </table>
         </div>
       </div>
+      {editionModal}
       <ConfirmDialog state={confirm} onClose={() => setConfirm(null)} />
     </div>
   );

@@ -17,8 +17,9 @@ import {
   ArrowUpDown,
   BookOpen
 } from 'lucide-react';
-import { BrancheParam } from '../types';
-import { api } from '../lib/api';
+import { BrancheParam, Categorie } from '../types';
+import { api, errMsg } from '../lib/api';
+import { ConfirmDialog, ConfirmState } from '../components/Shared';
 
 const DEFAULT_FORM: BrancheParam = {
   code: '',
@@ -31,6 +32,7 @@ const DEFAULT_FORM: BrancheParam = {
   alias_import: '',
   groupe_bordereau: '',
   ordre_bordereau: 999,
+  categorie_id: null,
 };
 
 export const ParametresPage: React.FC = () => {
@@ -38,6 +40,10 @@ export const ParametresPage: React.FC = () => {
   const [loading, setLoading] = useState<boolean>(true);
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
+  const [categoriesDb, setCategoriesDb] = useState<Categorie[]>([]);
+  const [showCategories, setShowCategories] = useState<boolean>(false);
+  const [nouvelleCategorie, setNouvelleCategorie] = useState<string>('');
+  const [confirmCat, setConfirmCat] = useState<ConfirmState | null>(null);
   
   // Quick inline edit
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -77,8 +83,9 @@ export const ParametresPage: React.FC = () => {
   const loadBranches = async () => {
     setLoading(true);
     try {
-      const data = await api.getBranches();
+      const [data, cats] = await Promise.all([api.getBranches(), api.getCategories()]);
       setBranches(data);
+      setCategoriesDb(cats);
     } catch (err) {
       console.error('Erreur chargement branches:', err);
       showToast('Erreur lors du chargement des branches', 'error');
@@ -116,6 +123,7 @@ export const ParametresPage: React.FC = () => {
     setModalForm({
       code: b.code,
       branche: b.branche,
+      categorie_id: b.categorie_id ?? null,
       sous_code: `${b.sous_code}_COPIE`,
       sous_libelle: `${b.sous_libelle} (Copie)`,
       taux_apport_courtier: b.taux_apport_courtier,
@@ -230,14 +238,12 @@ export const ParametresPage: React.FC = () => {
   // --- Categories & Filtering ---
   const zeroRateCount = branches.filter((b) => b.taux_apport_courtier === 0 || b.taux_apport_aga === 0).length;
 
+  const sansCategorie = branches.filter((b) => !b.categorie_id).length;
   const categories = [
-    { id: 'ALL', label: 'Toutes les branches' },
+    { id: 'ALL', label: `Toutes les branches (${branches.length})` },
     ...(zeroRateCount > 0 ? [{ id: 'ZERO_RATE', label: `⚠️ Taux nuls (${zeroRateCount})` }] : []),
-    { id: 'AUTO', label: 'Automobile' },
-    { id: 'TRANSPORT', label: 'Transport & Maritime' },
-    { id: 'INCENDIE', label: 'Incendie & Risques Divers' },
-    { id: 'RC', label: 'Responsabilité Civile' },
-    { id: 'AGRICOLE', label: 'Agricole' },
+    ...categoriesDb.map((c) => ({ id: `CAT_${c.id}`, label: `${c.libelle} (${branches.filter((b) => b.categorie_id === c.id).length})` })),
+    ...(sansCategorie > 0 ? [{ id: 'SANS', label: `Sans catégorie (${sansCategorie})` }] : []),
   ];
 
   const filtered = branches.filter((b) => {
@@ -253,14 +259,66 @@ export const ParametresPage: React.FC = () => {
 
     if (selectedCategory === 'ALL') return true;
     if (selectedCategory === 'ZERO_RATE') return b.taux_apport_courtier === 0 || b.taux_apport_aga === 0;
-    const bLower = (b.branche + ' ' + b.sous_libelle + ' ' + b.sous_code).toLowerCase();
-    if (selectedCategory === 'AUTO') return bLower.includes('auto') || b.code.startsWith('3.');
-    if (selectedCategory === 'TRANSPORT') return bLower.includes('navire') || bLower.includes('maritime') || bLower.includes('aérien') || bLower.includes('terrestre') || b.code.startsWith('4.') || b.code.startsWith('5.');
-    if (selectedCategory === 'INCENDIE') return bLower.includes('incendie') || bLower.includes('multirisques') || bLower.includes('degats') || bLower.includes('vol') || bLower.includes('catnat') || bLower.includes('bris') || b.code.startsWith('8.') || b.code.startsWith('2.');
-    if (selectedCategory === 'RC') return bLower.includes('responsabilité') || bLower.includes(' rc') || b.sous_code.startsWith('VR') || b.code.startsWith('13.') || b.code.startsWith('10.');
-    if (selectedCategory === 'AGRICOLE') return bLower.includes('agricole') || b.code.startsWith('9.6') || b.code.startsWith('9.7');
-    return true;
+    if (selectedCategory === 'SANS') return !b.categorie_id;
+    return `CAT_${b.categorie_id}` === selectedCategory;
   });
+
+  // --- CRUD des catégories ---
+  const enregistrerCategorie = async (c: Categorie) => {
+    try {
+      await api.saveCategorie(c);
+      await loadBranches();
+      return true;
+    } catch (err) {
+      showToast(errMsg(err), 'error');
+      return false;
+    }
+  };
+
+  const ajouterCategorie = async () => {
+    const libelle = nouvelleCategorie.trim();
+    if (!libelle) return;
+    const ordre = (categoriesDb.reduce((m, c) => Math.max(m, c.ordre), 0) || 0) + 10;
+    if (await enregistrerCategorie({ libelle, ordre })) {
+      setNouvelleCategorie('');
+      showToast(`Catégorie « ${libelle} » ajoutée.`);
+    }
+  };
+
+  const supprimerCategorie = (c: Categorie) => {
+    setConfirmCat({
+      title: 'Supprimer la catégorie ?',
+      danger: true,
+      message: (
+        <p>
+          Supprimer « <strong>{c.libelle}</strong> » ? Ses {c.nb_branches ?? 0} ligne(s) de paramètres passeront « Sans catégorie »
+          (taux inchangés).
+        </p>
+      ),
+      confirmLabel: 'Supprimer',
+      onConfirm: async () => {
+        try {
+          await api.deleteCategorie(c.id!);
+          if (selectedCategory === `CAT_${c.id}`) setSelectedCategory('ALL');
+          await loadBranches();
+          showToast(`Catégorie « ${c.libelle} » supprimée.`);
+        } catch (err) {
+          showToast(errMsg(err), 'error');
+        }
+      },
+    });
+  };
+
+  /** Range toutes les lignes affichées (filtre courant) dans une catégorie */
+  const rangerAffichees = async (categorieId: number | null) => {
+    try {
+      await api.affecterCategorie(filtered.map((b) => b.id!).filter(Boolean), categorieId);
+      await loadBranches();
+      showToast(`${filtered.length} ligne(s) rangée(s).`);
+    } catch (err) {
+      showToast(errMsg(err), 'error');
+    }
+  };
 
   // KPI Calculations
   const totalCount = branches.length;
@@ -376,6 +434,13 @@ export const ParametresPage: React.FC = () => {
               {cat.label}
             </button>
           ))}
+          <button
+            onClick={() => setShowCategories(true)}
+            title="Ajouter, renommer, ordonner ou supprimer les catégories"
+            className="px-3 py-1.5 rounded-lg text-xs font-bold border border-dashed border-indigo-300 text-indigo-700 hover:bg-indigo-50 cursor-pointer flex items-center gap-1"
+          >
+            <Edit2 className="w-3 h-3" /> Gérer les catégories
+          </button>
         </div>
 
         {/* Search */}
@@ -724,6 +789,22 @@ export const ParametresPage: React.FC = () => {
                 />
               </div>
 
+              <div>
+                <label className="block text-[11px] font-bold text-slate-700 uppercase tracking-wider mb-1">Catégorie</label>
+                <select
+                  value={modalForm.categorie_id ?? ''}
+                  onChange={(e) => setModalForm({ ...modalForm, categorie_id: e.target.value ? Number(e.target.value) : null })}
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium focus:outline-hidden focus:ring-2 focus:ring-indigo-500"
+                >
+                  <option value="">Sans catégorie</option>
+                  {categoriesDb.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.libelle}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
               <div className="grid grid-cols-3 gap-3">
                 <div>
                   <label className="block text-[11px] font-bold text-slate-700 uppercase tracking-wider mb-1">
@@ -961,6 +1042,89 @@ export const ParametresPage: React.FC = () => {
           </div>
         </div>
       )}
+      {showCategories && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-lg w-full overflow-hidden text-xs">
+            <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+              <h3 className="font-extrabold text-slate-900 text-sm">Catégories de paramètres</h3>
+              <button onClick={() => setShowCategories(false)} className="p-1 rounded-lg hover:bg-slate-200 text-slate-400 cursor-pointer">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-5 space-y-3">
+              <p className="text-slate-500">
+                Les catégories servent au classement de l'écran Paramètres (sans effet sur les calculs). Le libellé et l'ordre
+                sont enregistrés en quittant le champ.
+              </p>
+              <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl">
+                {categoriesDb.map((c) => (
+                  <div key={c.id} className="flex items-center gap-2 p-2">
+                    <input
+                      type="number"
+                      defaultValue={c.ordre}
+                      title="Ordre d'affichage"
+                      onBlur={(e) => {
+                        const ordre = parseInt(e.target.value, 10) || 0;
+                        if (ordre !== c.ordre) enregistrerCategorie({ ...c, ordre });
+                      }}
+                      className="w-16 px-2 py-1.5 border border-slate-200 rounded-lg text-center"
+                    />
+                    <input
+                      defaultValue={c.libelle}
+                      onBlur={(e) => {
+                        const libelle = e.target.value.trim();
+                        if (libelle && libelle !== c.libelle) enregistrerCategorie({ ...c, libelle });
+                        else e.target.value = c.libelle;
+                      }}
+                      className="flex-1 px-2 py-1.5 border border-slate-200 rounded-lg font-semibold"
+                    />
+                    <span className="text-slate-400 w-16 text-right">{c.nb_branches ?? 0} ligne(s)</span>
+                    <button onClick={() => supprimerCategorie(c)} title="Supprimer" className="p-1.5 rounded-lg hover:bg-rose-50 text-rose-600 cursor-pointer">
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+                {categoriesDb.length === 0 && <div className="p-4 text-center text-slate-400">Aucune catégorie.</div>}
+              </div>
+              <div className="flex gap-2">
+                <input
+                  value={nouvelleCategorie}
+                  onChange={(e) => setNouvelleCategorie(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && ajouterCategorie()}
+                  placeholder="Nouvelle catégorie…"
+                  className="flex-1 px-3 py-2 border border-slate-200 rounded-lg"
+                />
+                <button onClick={ajouterCategorie} className="px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-bold cursor-pointer flex items-center gap-1">
+                  <Plus className="w-3.5 h-3.5" /> Ajouter
+                </button>
+              </div>
+              {filtered.length > 0 && (
+                <div className="border-t border-slate-100 pt-3 flex flex-wrap items-center gap-2">
+                  <span className="text-slate-600">Ranger les {filtered.length} ligne(s) actuellement affichée(s) dans :</span>
+                  <select
+                    defaultValue=""
+                    onChange={(e) => {
+                      if (e.target.value === '') return;
+                      rangerAffichees(e.target.value === 'SANS' ? null : Number(e.target.value));
+                      e.target.value = '';
+                    }}
+                    className="px-2 py-1.5 border border-slate-200 rounded-lg"
+                  >
+                    <option value="">— choisir —</option>
+                    {categoriesDb.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.libelle}
+                      </option>
+                    ))}
+                    <option value="SANS">Sans catégorie</option>
+                  </select>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      <ConfirmDialog state={confirmCat} onClose={() => setConfirmCat(null)} />
     </div>
   );
 };

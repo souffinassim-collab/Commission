@@ -19,6 +19,21 @@ pub struct BrancheParam {
     /// Ordre d'affichage de la ligne cumulée sur le bordereau
     #[serde(default = "default_ordre")]
     pub ordre_bordereau: i32,
+    /// Catégorie d'affichage dans l'écran Paramètres (Automobile, Transport…) ; aucune = « Sans catégorie »
+    #[serde(default)]
+    pub categorie_id: Option<i64>,
+}
+
+/// Catégorie de paramètres (regroupement d'affichage, gérée par l'utilisateur)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Categorie {
+    pub id: Option<i64>,
+    pub libelle: String,
+    #[serde(default)]
+    pub ordre: i32,
+    /// Nombre de lignes de paramètres rattachées (lecture seule)
+    #[serde(default)]
+    pub nb_branches: i64,
 }
 
 fn default_ordre() -> i32 {
@@ -72,6 +87,9 @@ pub struct FichierBordereau {
     pub nb_lignes: i64,
     #[serde(default)]
     pub anomalies: Vec<Anomalie>,
+    /// Sélection retenue dans le fichier (ex: point de vente, clients)
+    #[serde(default)]
+    pub selection: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +115,41 @@ pub struct LigneContribution {
     /// Police exclue manuellement par le commercial (ex: prime non encaissée) : non commissionnée
     #[serde(default)]
     pub exclue: bool,
+    /// Informations de la police reprises du registre (pour le « Détail de production »)
+    #[serde(default)]
+    pub client_code: Option<String>,
+    #[serde(default)]
+    pub branche: Option<String>,
+    #[serde(default)]
+    pub date_emission: Option<String>,
+    #[serde(default)]
+    pub date_effet: Option<String>,
+    #[serde(default)]
+    pub date_echeance: Option<String>,
+    #[serde(default)]
+    pub cp: Option<f64>,
+    #[serde(default)]
+    pub prime_ttc: Option<f64>,
+    /// Police déjà facturée dans un autre bordereau (« bordereau X — facture N° Y ») : verrouillée, non comptée
+    #[serde(default)]
+    pub deja_facturee: Option<String>,
+    /// Code garantie d'origine (ex: VRC, VASS, VTR pour un PDF de flotte ; code branche pour un registre)
+    #[serde(default)]
+    pub garantie: Option<String>,
+}
+
+/// Facture de l'intermédiaire saisie par le commercial pour confirmation (rapprochement avec le calcul)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FactureIntermediaire {
+    #[serde(default)]
+    pub numero: String,
+    #[serde(default)]
+    pub date: String,
+    #[serde(default)]
+    pub commentaire: String,
+    /// Commission HT déclarée par ligne du bordereau (clé : code|libellé|branche de la ligne)
+    #[serde(default)]
+    pub montants_ht: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +212,9 @@ pub struct Bordereau {
     pub anomalies: Vec<Anomalie>,
     #[serde(default)]
     pub fichiers: Vec<FichierBordereau>,
+    /// Facture de l'intermédiaire saisie pour confirmation
+    #[serde(default)]
+    pub facture: Option<FactureIntermediaire>,
 }
 
 impl BordereauLigne {
@@ -200,6 +256,15 @@ pub struct ExtractedItem {
     /// "GARANTIE" (code garantie) ou "BRANCHE_IMPORT" (code branche d'un registre Excel)
     #[serde(default = "default_source_type")]
     pub source_type: String,
+    /// Registre Excel : dates (JJ/MM/AAAA) et coût de police
+    #[serde(default)]
+    pub date_emission: Option<String>,
+    #[serde(default)]
+    pub date_effet: Option<String>,
+    #[serde(default)]
+    pub date_echeance: Option<String>,
+    #[serde(default)]
+    pub cp: Option<f64>,
 }
 
 fn default_source_type() -> String {
@@ -231,6 +296,24 @@ pub struct UploadedFileResult {
     pub exercice: Option<i32>,
     #[serde(default)]
     pub mois: Option<i32>,
+    /// Registre Excel : point de vente retenu (préfixe du N° de police = code agence / AGA)
+    #[serde(default)]
+    pub point_vente: Option<String>,
+    /// Registre Excel : clients retenus (affaires apportées par un courtier)
+    #[serde(default)]
+    pub clients_selectionnes: Vec<String>,
+    /// Description de la sélection faite dans le fichier (enregistrée avec le bordereau)
+    #[serde(default)]
+    pub selection: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointVenteSummary {
+    pub code: String,
+    pub nombre_polices: usize,
+    pub nombre_clients: usize,
+    pub total_prime_nette: f64,
+    pub branches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,15 +326,22 @@ pub struct ExcelClientSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExcelScanResult {
+    /// Identifiant du classeur conservé côté application le temps de la sélection
+    pub staging_id: String,
     pub file_name: String,
-    pub clients: Vec<ExcelClientSummary>,
     pub total_lignes: usize,
-    pub multiple_clients: bool,
+    pub points_vente: Vec<PointVenteSummary>,
+    /// Informations de l'export CIRIS (agence, période d'extraction)
+    pub info_export: Vec<String>,
+    pub periode_emission: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalculateMultiBordereauRequest {
     pub files: Vec<UploadedFileResult>,
+    /// Bordereau en cours de modification (ses propres polices ne sont pas des doublons)
+    #[serde(default)]
+    pub bordereau_id: Option<i64>,
     #[serde(default)]
     pub intermediaire_id: Option<i64>,
     pub type_intermediaire: String, // "COURTIER" ou "AGA"

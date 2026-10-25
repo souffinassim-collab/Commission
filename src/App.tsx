@@ -65,7 +65,7 @@ export function App() {
             }}
           />
         )}
-        {activeTab === 'bordereaux' && <BordereauxPage />}
+        {activeTab === 'bordereaux' && <BordereauxPage onNouveau={() => navigate('import')} />}
         {activeTab === 'parametres' && <ParametresPage />}
         {activeTab === 'intermediaires' && <IntermediairesPage />}
         {activeTab === 'bdd' && <DatabasePage />}

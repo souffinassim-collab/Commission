@@ -202,6 +202,9 @@ fn finalize_result(
         taille: 0,
         exercice: None,
         mois: None,
+        point_vente: None,
+        clients_selectionnes: Vec::new(),
+        selection: None,
     }
 }
 
@@ -446,6 +449,10 @@ impl CirisPdfParser {
                     prime_ttc: ttc,
                     code_ministeriel: br.code_ministeriel.clone(),
                     source_type: "GARANTIE".to_string(),
+                    date_emission: None,
+                    date_effet: None,
+                    date_echeance: None,
+                    cp: None,
                 });
             }
         }
@@ -667,6 +674,10 @@ impl FlottePdfParser {
                     prime_ttc: None,
                     code_ministeriel: code_min.clone(),
                     source_type: "GARANTIE".to_string(),
+                    date_emission: None,
+                    date_effet: None,
+                    date_echeance: None,
+                    cp: None,
                 });
             }
         }
@@ -730,6 +741,25 @@ struct ExcelColumns {
     prime_nette: usize,
     prime_ttc: Option<usize>,
     date_emission: Option<usize>,
+    date_effet: Option<usize>,
+    date_echeance: Option<usize>,
+    cp: Option<usize>,
+}
+
+/// Feuille de données du registre : colonnes repérées et ligne d'en-tête
+/// Feuille de détail du registre (un export volumineux continue sur plusieurs feuilles)
+struct FeuilleDonnees {
+    nom: String,
+    range: calamine::Range<calamine::Data>,
+    cols: ExcelColumns,
+    /// Première ligne de données (après l'en-tête)
+    debut: usize,
+}
+
+struct ExcelData {
+    feuilles: Vec<FeuilleDonnees>,
+    /// Informations de la feuille « Parametres » de l'export CIRIS (agence, période d'extraction)
+    info_export: Vec<String>,
 }
 
 fn normalize_header(s: &str) -> String {
@@ -785,30 +815,57 @@ fn cell_date(c: &calamine::Data) -> Option<chrono::NaiveDate> {
     base.checked_add_signed(chrono::Duration::days(serial.floor() as i64))
 }
 
-impl ExcelProductionParser {
-    fn open_range(bytes: &[u8]) -> Result<calamine::Range<calamine::Data>, String> {
-        use calamine::{open_workbook_auto_from_rs, Reader};
-        let cursor = std::io::Cursor::new(bytes.to_vec());
-        let mut excel = open_workbook_auto_from_rs(cursor).map_err(|e| format!("Erreur ouverture Excel: {:?}", e))?;
-        let names = excel.sheet_names().to_vec();
-        let sheet = names
-            .iter()
-            .find(|n| n.as_str() == "RCCPDE_D")
-            .or_else(|| names.first())
-            .cloned()
-            .ok_or_else(|| "Aucune feuille trouvée dans le classeur Excel".to_string())?;
-        excel
-            .worksheet_range(&sheet)
-            .map_err(|e| format!("Erreur lecture feuille {}: {:?}", sheet, e))
-    }
+/// Point de vente (agence) d'une police : premier segment du numéro ("492/VR/187/0/0" -> "492")
+pub fn point_de_vente(police: &str) -> String {
+    police.split('/').next().unwrap_or("").trim().to_string()
+}
 
-    fn detect_columns(range: &calamine::Range<calamine::Data>) -> Result<ExcelColumns, String> {
-        let header = range.rows().next().ok_or_else(|| "Le classeur est vide.".to_string())?;
+/// Sélection faite par l'utilisateur dans un registre de production
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct ExcelSelection {
+    /// Point de vente retenu (préfixe du numéro de police) ; aucun = tout le fichier
+    #[serde(default)]
+    pub point_vente: Option<String>,
+    /// Clients retenus (codes exacts) — affaires apportées par un courtier ; vide = tout le point de vente
+    #[serde(default)]
+    pub clients: Vec<String>,
+}
+
+/// Période du bordereau : seules les polices émises dans cette période sont retenues
+#[derive(Debug, Clone, Copy)]
+pub struct PeriodeBordereau {
+    pub exercice: i32,
+    pub mois: Option<i32>,
+}
+
+impl PeriodeBordereau {
+    fn contient(&self, d: chrono::NaiveDate) -> bool {
+        use chrono::Datelike;
+        d.year() == self.exercice && self.mois.map_or(true, |m| d.month() as i32 == m)
+    }
+    fn libelle(&self) -> String {
+        match self.mois {
+            Some(m) => format!("{:02}/{}", m, self.exercice),
+            None => format!("exercice {}", self.exercice),
+        }
+    }
+}
+
+impl ExcelProductionParser {
+    /// Repère l'en-tête (Police, Code Client, Désignation, Branche, Prime Nette) dans une ligne
+    fn columns_from_row(row: &[calamine::Data]) -> Result<ExcelColumns, Vec<&'static str>> {
         let (mut police, mut code_client, mut designation, mut branche, mut prime_nette) = (None, None, None, None, None);
         let (mut prime_ttc, mut date_emission) = (None, None);
-        for (idx, cell) in header.iter().enumerate() {
+        let (mut date_effet, mut date_echeance, mut cp) = (None, None, None);
+        for (idx, cell) in row.iter().enumerate() {
             let s = normalize_header(&cell.to_string());
-            if s.contains("police") && police.is_none() {
+            if s.trim() == "cp" && cp.is_none() {
+                cp = Some(idx);
+            } else if s.contains("effet") && date_effet.is_none() {
+                date_effet = Some(idx);
+            } else if s.contains("echean") && date_echeance.is_none() {
+                date_echeance = Some(idx);
+            } else if s.contains("police") && police.is_none() {
                 police = Some(idx);
             } else if s.contains("code") && s.contains("client") {
                 code_client = Some(idx);
@@ -831,10 +888,7 @@ impl ExcelProductionParser {
         if branche.is_none() { missing.push("Branche"); }
         if prime_nette.is_none() { missing.push("Prime Nette"); }
         if !missing.is_empty() {
-            return Err(format!(
-                "Colonnes obligatoires introuvables dans l'en-tête du registre Excel : {}.",
-                missing.join(", ")
-            ));
+            return Err(missing);
         }
         Ok(ExcelColumns {
             police: police.unwrap(),
@@ -844,94 +898,252 @@ impl ExcelProductionParser {
             prime_nette: prime_nette.unwrap(),
             prime_ttc,
             date_emission,
+            date_effet,
+            date_echeance,
+            cp,
         })
     }
 
-    pub fn scan_clients_from_bytes(bytes: &[u8], file_name: &str) -> Result<crate::models::ExcelScanResult, String> {
-        let range = Self::open_range(bytes)?;
-        let cols = Self::detect_columns(&range)?;
-        let mut client_map: std::collections::HashMap<String, (String, usize, f64)> = std::collections::HashMap::new();
-        let mut total_rows = 0;
-
-        for row in range.rows().skip(1) {
-            let code = row.get(cols.code_client).map(cell_text).unwrap_or_default();
-            if code.is_empty() || code.to_lowercase().contains("total") {
-                continue;
-            }
-            let desig = row.get(cols.designation).map(cell_text).unwrap_or_default();
-            let prime = row.get(cols.prime_nette).and_then(cell_amount).unwrap_or(0.0);
-            total_rows += 1;
-            let entry = client_map.entry(code).or_insert((desig, 0, 0.0));
-            entry.1 += 1;
-            entry.2 += prime;
+    /// Ouvre le classeur (.xls ou .xlsx) et retient TOUTES les feuilles de détail, dans l'ordre du classeur :
+    /// l'export CIRIS place des feuilles de paramètres avant le détail (en-tête qui n'est pas en première
+    /// ligne), et un export volumineux continue sur les feuilles suivantes (2, 3…), avec ou sans en-tête répété.
+    fn open_data(bytes: &[u8]) -> Result<ExcelData, String> {
+        use calamine::{open_workbook_auto_from_rs, Reader};
+        let cursor = std::io::Cursor::new(bytes.to_vec());
+        let mut excel = open_workbook_auto_from_rs(cursor).map_err(|e| format!("Erreur ouverture Excel: {:?}", e))?;
+        let names = excel.sheet_names().to_vec();
+        if names.is_empty() {
+            return Err("Aucune feuille trouvée dans le classeur Excel".to_string());
         }
 
-        let mut clients: Vec<crate::models::ExcelClientSummary> = client_map
+        let mut info_export = Vec::new();
+        let mut feuilles: Vec<FeuilleDonnees> = Vec::new();
+        let mut meilleur_manque: Option<Vec<&'static str>> = None;
+        for name in &names {
+            let range = match excel.worksheet_range(name) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if normalize_header(name).starts_with("parametres") {
+                for row in range.rows() {
+                    let label = row.first().map(cell_text).unwrap_or_default();
+                    let val = row.get(1).map(|c| match c {
+                        calamine::Data::Float(_) | calamine::Data::DateTime(_) if normalize_header(&label).contains("date") || label.contains("Export") => {
+                            cell_date(c).map(|d| d.format("%d/%m/%Y").to_string()).unwrap_or_else(|| cell_text(c))
+                        }
+                        _ => cell_text(c),
+                    });
+                    let l = normalize_header(&label);
+                    if let Some(v) = val.filter(|v| !v.is_empty()) {
+                        if l.starts_with("agence") || l.contains("de la date") || l.contains("a la date") || l.starts_with("exporte") {
+                            info_export.push(format!("{} {}", label.trim_end_matches(':').trim(), v));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // 1. Feuille avec son propre en-tête
+            let mut trouvee = false;
+            for (idx, row) in range.rows().enumerate().take(60) {
+                match Self::columns_from_row(row) {
+                    Ok(cols) => {
+                        feuilles.push(FeuilleDonnees { nom: name.clone(), range: range.clone(), cols, debut: idx + 1 });
+                        trouvee = true;
+                        break;
+                    }
+                    Err(missing) => {
+                        if missing.len() < 5 && meilleur_manque.as_ref().map_or(true, |m| missing.len() < m.len()) {
+                            meilleur_manque = Some(missing);
+                        }
+                    }
+                }
+            }
+            if trouvee {
+                continue;
+            }
+            // 2. Suite d'une feuille précédente sans en-tête répété : mêmes colonnes, lignes de polices
+            if let Some(prec) = feuilles.last() {
+                let (ip, ib, inn) = (prec.cols.police, prec.cols.branche, prec.cols.prime_nette);
+                let debut = range.rows().position(|row| {
+                    let p = row.get(ip).map(cell_text).unwrap_or_default();
+                    p.split('/').count() >= 3
+                        && !row.get(ib).map(cell_text).unwrap_or_default().is_empty()
+                        && row.get(inn).and_then(cell_amount).is_some()
+                });
+                if let Some(debut) = debut {
+                    let cols = ExcelColumns {
+                        police: prec.cols.police,
+                        code_client: prec.cols.code_client,
+                        designation: prec.cols.designation,
+                        branche: prec.cols.branche,
+                        prime_nette: prec.cols.prime_nette,
+                        prime_ttc: prec.cols.prime_ttc,
+                        date_emission: prec.cols.date_emission,
+                        date_effet: prec.cols.date_effet,
+                        date_echeance: prec.cols.date_echeance,
+                        cp: prec.cols.cp,
+                    };
+                    feuilles.push(FeuilleDonnees { nom: name.clone(), range: range.clone(), cols, debut });
+                }
+            }
+        }
+        if feuilles.is_empty() {
+            return Err(match meilleur_manque {
+                Some(m) => format!("Colonnes obligatoires introuvables dans l'en-tête du registre Excel : {}.", m.join(", ")),
+                None => "Aucune feuille de production (colonnes Police, Code Client, Branche, Prime Nette) trouvée dans ce classeur.".to_string(),
+            });
+        }
+        Ok(ExcelData { feuilles, info_export })
+    }
+
+    /// Lignes de données de toutes les feuilles : (repère « feuille, ligne », colonnes de la feuille, ligne)
+    fn data_rows<'a>(d: &'a ExcelData) -> impl Iterator<Item = (String, &'a ExcelColumns, &'a [calamine::Data])> {
+        let plusieurs = d.feuilles.len() > 1;
+        d.feuilles.iter().flat_map(move |f| {
+            f.range.rows().enumerate().skip(f.debut).map(move |(i, r)| {
+                let repere = if plusieurs { format!("{} ligne {}", f.nom, i + 1) } else { format!("{}", i + 1) };
+                (repere, &f.cols, r)
+            })
+        })
+    }
+
+    /// Analyse rapide : points de vente présents (préfixe du N° de police), sans doublon
+    pub fn scan_from_bytes(bytes: &[u8], file_name: &str) -> Result<crate::models::ExcelScanResult, String> {
+        use std::collections::{BTreeMap, BTreeSet, HashSet};
+        let d = Self::open_data(bytes)?;
+        struct Pv {
+            polices: usize,
+            total: f64,
+            clients: HashSet<String>,
+            branches: BTreeSet<String>,
+        }
+        let mut pvs: BTreeMap<String, Pv> = BTreeMap::new();
+        let mut total_lignes = 0;
+        let mut date_min: Option<chrono::NaiveDate> = None;
+        let mut date_max: Option<chrono::NaiveDate> = None;
+        for (_, cols, row) in Self::data_rows(&d) {
+            let police = row.get(cols.police).map(cell_text).unwrap_or_default();
+            if police.is_empty() || police.to_lowercase().contains("total") {
+                continue;
+            }
+            total_lignes += 1;
+            let pv = pvs.entry(point_de_vente(&police)).or_insert(Pv {
+                polices: 0,
+                total: 0.0,
+                clients: HashSet::new(),
+                branches: BTreeSet::new(),
+            });
+            pv.polices += 1;
+            pv.total += row.get(cols.prime_nette).and_then(cell_amount).unwrap_or(0.0);
+            pv.clients.insert(row.get(cols.code_client).map(cell_text).unwrap_or_default());
+            let br = row.get(cols.branche).map(cell_text).unwrap_or_default().to_uppercase();
+            if !br.is_empty() {
+                pv.branches.insert(br);
+            }
+            if let Some(dt) = cols.date_emission.and_then(|i| row.get(i)).and_then(cell_date) {
+                date_min = Some(date_min.map_or(dt, |m| m.min(dt)));
+                date_max = Some(date_max.map_or(dt, |m| m.max(dt)));
+            }
+        }
+        let points_vente: Vec<crate::models::PointVenteSummary> = pvs
             .into_iter()
-            .map(|(code, (nom, count, sum))| crate::models::ExcelClientSummary {
+            .map(|(code, p)| crate::models::PointVenteSummary {
+                code,
+                nombre_polices: p.polices,
+                nombre_clients: p.clients.len(),
+                total_prime_nette: round2(p.total),
+                branches: p.branches.into_iter().collect(),
+            })
+            .collect();
+        Ok(crate::models::ExcelScanResult {
+            staging_id: String::new(),
+            file_name: file_name.to_string(),
+            total_lignes,
+            points_vente,
+            info_export: d.info_export,
+            periode_emission: match (date_min, date_max) {
+                (Some(a), Some(b)) => Some(format!("{} - {}", a.format("%d/%m/%Y"), b.format("%d/%m/%Y"))),
+                _ => None,
+            },
+        })
+    }
+
+    /// Clients d'un point de vente (un par code, polices regroupées)
+    pub fn clients_from_bytes(bytes: &[u8], point_vente: &str) -> Result<Vec<crate::models::ExcelClientSummary>, String> {
+        let d = Self::open_data(bytes)?;
+        let mut map: std::collections::HashMap<String, (String, usize, f64)> = std::collections::HashMap::new();
+        for (_, cols, row) in Self::data_rows(&d) {
+            let police = row.get(cols.police).map(cell_text).unwrap_or_default();
+            if police.is_empty() || point_de_vente(&police) != point_vente.trim() {
+                continue;
+            }
+            let code = row.get(cols.code_client).map(cell_text).unwrap_or_default();
+            let desig = row.get(cols.designation).map(cell_text).unwrap_or_default();
+            let e = map.entry(code).or_insert((desig, 0, 0.0));
+            e.1 += 1;
+            e.2 += row.get(cols.prime_nette).and_then(cell_amount).unwrap_or(0.0);
+        }
+        let mut clients: Vec<crate::models::ExcelClientSummary> = map
+            .into_iter()
+            .map(|(code, (nom, n, s))| crate::models::ExcelClientSummary {
                 code_client: code,
                 designation_client: nom,
-                nombre_polices: count,
-                total_prime_nette: round2(sum),
+                nombre_polices: n,
+                total_prime_nette: round2(s),
             })
             .collect();
         clients.sort_by(|a, b| b.total_prime_nette.partial_cmp(&a.total_prime_nette).unwrap_or(std::cmp::Ordering::Equal));
-        let multiple_clients = clients.len() > 1;
-
-        Ok(crate::models::ExcelScanResult {
-            file_name: file_name.to_string(),
-            clients,
-            total_lignes: total_rows,
-            multiple_clients,
-        })
+        Ok(clients)
     }
 
-    pub fn parse_from_bytes(bytes: &[u8], file_name: &str, client_filter: Option<&str>) -> Result<UploadedFileResult, String> {
-        let range = Self::open_range(bytes)?;
-        let cols = Self::detect_columns(&range)?;
+    pub fn parse_from_bytes(
+        bytes: &[u8],
+        file_name: &str,
+        selection: &ExcelSelection,
+        periode: Option<PeriodeBordereau>,
+    ) -> Result<UploadedFileResult, String> {
+        use std::collections::{BTreeMap, BTreeSet, HashSet};
+        let d = Self::open_data(bytes)?;
         let mut anomalies: Vec<Anomalie> = Vec::new();
 
-        let filter = client_filter.map(|f| f.trim().to_lowercase()).unwrap_or_default();
-        // Filtre strict sur le code client s'il correspond exactement à un code du fichier,
-        // sinon recherche dans le code ou la désignation
-        let exact_code_mode = !filter.is_empty()
-            && range
-                .rows()
-                .skip(1)
-                .any(|row| row.get(cols.code_client).map(|c| cell_text(c).to_lowercase() == filter).unwrap_or(false));
+        let pv_filtre = selection.point_vente.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let clients_filtre: HashSet<String> = selection
+            .clients
+            .iter()
+            .map(|c| c.trim().to_uppercase())
+            .filter(|c| !c.is_empty())
+            .collect();
 
         let mut items = Vec::new();
-        let mut clients: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-        let mut polices_vues: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-        let mut date_min: Option<chrono::NaiveDate> = None;
-        let mut date_max: Option<chrono::NaiveDate> = None;
+        let mut clients_trouves: BTreeMap<String, String> = BTreeMap::new();
+        let mut pvs_trouves: BTreeSet<String> = BTreeSet::new();
+        let mut polices_vues: BTreeMap<String, usize> = BTreeMap::new();
+        let (mut date_min, mut date_max): (Option<chrono::NaiveDate>, Option<chrono::NaiveDate>) = (None, None);
+        let (mut hors_periode, mut hors_periode_montant) = (0usize, 0.0);
+        let (mut sans_date, mut nulles) = (0usize, 0usize);
 
-        for (ridx, row) in range.rows().enumerate().skip(1) {
-            let ligne_excel = ridx + 1;
+        for (ligne_excel, cols, row) in Self::data_rows(&d) {
             if row.iter().all(|c| cell_text(c).is_empty()) {
                 continue;
             }
             let code = row.get(cols.code_client).map(cell_text).unwrap_or_default();
             let desig = row.get(cols.designation).map(cell_text).unwrap_or_default();
             let police = row.get(cols.police).map(cell_text).unwrap_or_default();
-
             if code.to_lowercase().contains("total") || police.to_lowercase().contains("total") {
                 anomalies.push(Anomalie::info(format!("Ligne {} : ligne de total ignorée.", ligne_excel)));
                 continue;
             }
-
-            if exact_code_mode {
-                if code.to_lowercase() != filter {
+            let pv = point_de_vente(&police);
+            if let Some(f) = &pv_filtre {
+                if &pv != f {
                     continue;
                 }
-            } else if !filter.is_empty()
-                && !code.to_lowercase().contains(&filter)
-                && !desig.to_lowercase().contains(&filter)
-            {
+            }
+            if !clients_filtre.is_empty() && !clients_filtre.contains(&code.to_uppercase()) {
                 continue;
             }
 
-            let branche = row.get(cols.branche).map(cell_text).unwrap_or_default().to_uppercase();
             let prime = match row.get(cols.prime_nette).and_then(cell_amount) {
                 Some(p) => p,
                 None => {
@@ -942,6 +1154,19 @@ impl ExcelProductionParser {
                     continue;
                 }
             };
+            let date = cols.date_emission.and_then(|i| row.get(i)).and_then(cell_date);
+            if let Some(p) = periode {
+                match date {
+                    Some(dt) if !p.contient(dt) => {
+                        hors_periode += 1;
+                        hors_periode_montant += prime;
+                        continue;
+                    }
+                    None => sans_date += 1,
+                    _ => {}
+                }
+            }
+            let branche = row.get(cols.branche).map(cell_text).unwrap_or_default().to_uppercase();
             if branche.is_empty() {
                 anomalies.push(Anomalie::erreur(format!(
                     "Ligne {} (police {}) : branche absente, prime {} non affectable.",
@@ -951,25 +1176,25 @@ impl ExcelProductionParser {
                 )));
                 continue;
             }
-            if code.is_empty() {
-                anomalies.push(Anomalie::avertissement(format!(
-                    "Ligne {} (police {}) : code client absent.",
-                    ligne_excel, police
-                )));
-            }
-            if !police.is_empty() {
+            if police.is_empty() {
+                anomalies.push(Anomalie::avertissement(format!("Ligne {} : numéro de police absent.", ligne_excel)));
+            } else {
                 *polices_vues.entry(police.clone()).or_insert(0) += 1;
             }
-            if let Some(d) = cols.date_emission.and_then(|i| row.get(i)).and_then(cell_date) {
-                date_min = Some(date_min.map_or(d, |m| m.min(d)));
-                date_max = Some(date_max.map_or(d, |m| m.max(d)));
+            if let Some(dt) = date {
+                date_min = Some(date_min.map_or(dt, |m| m.min(dt)));
+                date_max = Some(date_max.map_or(dt, |m| m.max(dt)));
             }
             if prime == 0.0 {
+                nulles += 1;
                 continue;
             }
-            clients.entry(code.clone()).or_insert(desig.clone());
+            clients_trouves.entry(code.clone()).or_insert(desig.clone());
+            pvs_trouves.insert(pv);
             let prime_ttc = cols.prime_ttc.and_then(|i| row.get(i)).and_then(cell_amount);
-
+            let date_txt = |col: Option<usize>| col.and_then(|i| row.get(i)).and_then(cell_date).map(|d| d.format("%d/%m/%Y").to_string());
+            let (date_effet, date_echeance) = (date_txt(cols.date_effet), date_txt(cols.date_echeance));
+            let cp = cols.cp.and_then(|i| row.get(i)).and_then(cell_amount);
             items.push(ExtractedItem {
                 fichier_source: file_name.to_string(),
                 police: if police.is_empty() { None } else { Some(police) },
@@ -983,70 +1208,96 @@ impl ExcelProductionParser {
                 prime_ttc,
                 code_ministeriel: None,
                 source_type: "BRANCHE_IMPORT".to_string(),
+                date_emission: date.map(|d| d.format("%d/%m/%Y").to_string()),
+                date_effet,
+                date_echeance,
+                cp,
             });
         }
 
         for (p, n) in polices_vues.iter().filter(|(_, n)| **n > 1) {
             anomalies.push(Anomalie::avertissement(format!("Police {} présente {} fois dans le registre.", p, n)));
         }
-        if clients.len() > 1 {
+        if let Some(p) = periode {
+            if hors_periode > 0 {
+                anomalies.push(Anomalie::info(format!(
+                    "{} ligne(s) émise(s) hors de la période du bordereau ({}) non retenue(s) — {} DZD.",
+                    hors_periode,
+                    p.libelle(),
+                    fmt_montant(round2(hors_periode_montant))
+                )));
+            }
+            if sans_date > 0 {
+                anomalies.push(Anomalie::avertissement(format!(
+                    "{} ligne(s) sans date d'émission : retenue(s) sans contrôle de période.",
+                    sans_date
+                )));
+            }
+        }
+        if nulles > 0 {
+            anomalies.push(Anomalie::info(format!("{} ligne(s) à prime nette nulle ignorée(s).", nulles)));
+        }
+        let manquants: Vec<&String> = selection
+            .clients
+            .iter()
+            .filter(|c| !clients_trouves.keys().any(|k| k.eq_ignore_ascii_case(c.trim())))
+            .collect();
+        if !manquants.is_empty() && !items.is_empty() {
             anomalies.push(Anomalie::avertissement(format!(
-                "{} clients différents retenus dans ce fichier{}.",
-                clients.len(),
-                if filter.is_empty() { " (aucun filtre client appliqué)" } else { "" }
+                "Client(s) sélectionné(s) sans production retenue sur la période : {}.",
+                manquants.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            )));
+        }
+        if pv_filtre.is_none() && pvs_trouves.len() > 1 {
+            anomalies.push(Anomalie::erreur(format!(
+                "Le registre contient {} points de vente ({}) : choisissez celui du bordereau.",
+                pvs_trouves.len(),
+                pvs_trouves.iter().cloned().collect::<Vec<_>>().join(", ")
             )));
         }
         if items.is_empty() {
-            anomalies.push(Anomalie::erreur(if filter.is_empty() {
-                "Aucune ligne de production exploitable dans le registre.".to_string()
-            } else {
-                format!("Aucune ligne ne correspond au filtre client « {} ».", filter)
-            }));
+            anomalies.push(Anomalie::erreur(format!(
+                "Aucune ligne de production retenue{}{}.",
+                pv_filtre.as_ref().map(|p| format!(" pour le point de vente {}", p)).unwrap_or_default(),
+                periode.map(|p| format!(" sur la période {}", p.libelle())).unwrap_or_default()
+            )));
+        }
+        for info in &d.info_export {
+            anomalies.push(Anomalie::info(format!("Export CIRIS — {}", info)));
         }
 
-        let valid_codes: Vec<String> = {
-            let mut set = std::collections::BTreeSet::new();
-            for c in clients.keys() {
-                let trimmed = c.trim();
-                if !trimmed.is_empty() {
-                    set.insert(trimmed.to_string());
-                }
-            }
-            set.into_iter().collect()
-        };
-        let valid_noms: Vec<String> = {
-            let mut set = std::collections::BTreeSet::new();
-            for n in clients.values() {
-                let trimmed = n.trim();
-                if !trimmed.is_empty() {
-                    set.insert(trimmed.to_string());
-                }
-            }
-            set.into_iter().collect()
-        };
-
-        let client_code = if valid_codes.len() == 1 {
-            Some(valid_codes[0].clone())
+        // Point de vente = code de l'agence / de l'AGA ; clients = affaires d'un courtier
+        let point_vente = pv_filtre.clone().or_else(|| if pvs_trouves.len() == 1 { pvs_trouves.iter().next().cloned() } else { None });
+        let (code, nom) = if clients_filtre.is_empty() {
+            (point_vente.clone(), None)
+        } else if clients_trouves.len() == 1 {
+            let (c, n) = clients_trouves.iter().next().unwrap();
+            (Some(c.clone()), Some(n.clone()))
         } else {
-            None
+            (None, None)
         };
-
-        let client_nom = if valid_noms.len() == 1 {
-            Some(valid_noms[0].clone())
-        } else {
-            None
-        };
-        let periode = match (date_min, date_max) {
+        let periode_txt = match (date_min, date_max) {
             (Some(a), Some(b)) => Some(format!("{} - {}", a.format("%d/%m/%Y"), b.format("%d/%m/%Y"))),
             _ => None,
         };
-        let mut res = finalize_result("excel", file_name, "EXCEL_PRODUCTION", client_nom, client_code, periode, items, anomalies);
+        let mut res = finalize_result("excel", file_name, "EXCEL_PRODUCTION", nom, code, periode_txt, items, anomalies);
         if let (Some(a), Some(b)) = (date_min, date_max) {
             use chrono::Datelike;
             if a.year() == b.year() {
                 res.exercice = Some(a.year());
             }
         }
+        res.point_vente = point_vente.clone();
+        res.clients_selectionnes = clients_trouves.keys().filter(|_| !clients_filtre.is_empty()).cloned().collect();
+        res.selection = Some(match (&point_vente, clients_filtre.is_empty()) {
+            (Some(pv), true) => format!("Point de vente {} (tout le portefeuille)", pv),
+            (Some(pv), false) => format!(
+                "Point de vente {} — client(s) : {}",
+                pv,
+                clients_trouves.iter().map(|(c, n)| format!("{} {}", c, n)).collect::<Vec<_>>().join(", ")
+            ),
+            (None, _) => "Tout le fichier".to_string(),
+        });
         Ok(res)
     }
 }
@@ -1054,6 +1305,19 @@ impl ExcelProductionParser {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    /// Fichier réel de test, cherché dans Docs/, docs/, Import/ puis à la racine du projet.
+    /// Absent : le test concerné est sauté (avec un message), les fichiers métier n'étant pas versionnés.
+    pub fn fichier_test(nom: &str) -> Option<Vec<u8>> {
+        for dossier in ["../Docs", "../docs", "../Import", ".."] {
+            let p = std::path::Path::new(dossier).join(nom);
+            if let Ok(b) = std::fs::read(&p) {
+                return Some(b);
+            }
+        }
+        eprintln!("[test sauté] fichier {} introuvable (Docs/, Import/ ou racine)", nom);
+        None
+    }
 
     /// Sous-codes des paramètres par défaut (initial_rates.json), tels que chargés depuis la BDD
     pub fn known() -> Vec<String> {
@@ -1155,17 +1419,122 @@ pub mod tests {
             return;
         }
         let bytes = std::fs::read(path).unwrap();
-        let scan = ExcelProductionParser::scan_clients_from_bytes(&bytes, "Divers.xlsx").unwrap();
-        assert!(scan.multiple_clients);
-        let res = ExcelProductionParser::parse_from_bytes(&bytes, "Divers.xlsx", Some("SPA FSP")).unwrap();
-        println!("FILTER SPA FSP -> code: {:?}, courtier_ou_client: {:?}", res.code, res.courtier_ou_client);
-        // 12 lignes SPA FSP dont 2 à prime nulle (ignorées)
+        let scan = ExcelProductionParser::scan_from_bytes(&bytes, "Divers.xlsx").unwrap();
+        assert_eq!(scan.points_vente.len(), 1);
+        assert_eq!(scan.points_vente[0].code, "347");
+        let clients = ExcelProductionParser::clients_from_bytes(&bytes, "347").unwrap();
+        assert!(clients.iter().any(|c| c.code_client == "347024203/0"));
+        // Client SPA FSP : 12 lignes dont 2 à prime nulle (ignorées)
+        let sel = ExcelSelection { point_vente: Some("347".into()), clients: vec!["347024203/0".into()] };
+        let res = ExcelProductionParser::parse_from_bytes(&bytes, "Divers.xlsx", &sel, None).unwrap();
         assert_eq!(res.items.len(), 10);
         assert!(res.items.iter().all(|i| i.source_type == "BRANCHE_IMPORT"));
+        assert!(res.items.iter().all(|i| i.client_code.as_deref() == Some("347024203/0")));
         assert_eq!(res.exercice, Some(2025));
-        let exact = ExcelProductionParser::parse_from_bytes(&bytes, "Divers.xlsx", Some("347024203/0")).unwrap();
-        println!("FILTER 347024203/0 -> code: {:?}, courtier_ou_client: {:?}", exact.code, exact.courtier_ou_client);
-        assert!(!exact.items.is_empty());
-        assert!(exact.items.iter().all(|i| i.client_code.as_deref() == Some("347024203/0")));
+        assert_eq!(res.point_vente.as_deref(), Some("347"));
+        assert_eq!(res.code.as_deref(), Some("347024203/0"));
+    }
+
+    /// Export volumineux : le détail continue sur les feuilles suivantes (avec ou sans en-tête répété)
+    #[test]
+    fn test_registre_sur_plusieurs_feuilles() {
+        use rust_xlsxwriter::Workbook;
+        let mut wb = Workbook::new();
+        let entete = ["Police", "Code Client", "Designation Client", "Type Client", "Branche", "Date d'émission", "Prime Nette"];
+        let p = wb.add_worksheet();
+        p.set_name("Parametres").unwrap();
+        p.write_string(7, 0, "Agence :").unwrap();
+        p.write_string(7, 1, "7 - SUCCURSALE GHARDAIA").unwrap();
+        let lignes = |ws: &mut rust_xlsxwriter::Worksheet, debut: u32, data: &[(&str, &str, f64)]| {
+            for (i, (police, branche, prime)) in data.iter().enumerate() {
+                let r = debut + i as u32;
+                ws.write_string(r, 0, *police).unwrap();
+                ws.write_string(r, 1, "C1/0").unwrap();
+                ws.write_string(r, 2, "CLIENT UN").unwrap();
+                ws.write_string(r, 3, "Individuel").unwrap();
+                ws.write_string(r, 4, *branche).unwrap();
+                ws.write_number(r, 5, 46150.0).unwrap(); // 07/05/2026
+                ws.write_number(r, 6, *prime).unwrap();
+            }
+        };
+        // Feuille 1 : en-tête en ligne 7
+        let f1 = wb.add_worksheet();
+        f1.set_name("RCCPDE_S").unwrap();
+        for (c, h) in entete.iter().enumerate() {
+            f1.write_string(6, c as u16, *h).unwrap();
+        }
+        lignes(f1, 7, &[("492/VP/1/0/0", "VP", 100.0), ("492/VP/2/0/0", "VP", 200.0), ("445/VP/1/0/0", "VP", 50.0)]);
+        // Feuille 2 : suite sans en-tête
+        let f2 = wb.add_worksheet();
+        f2.set_name("RCCPDE_S2").unwrap();
+        lignes(f2, 0, &[("492/CN/1/0/0", "CN", 300.0), ("492/VR/1/0/0", "VR", 400.0)]);
+        // Feuille 3 : suite avec en-tête répété
+        let f3 = wb.add_worksheet();
+        f3.set_name("RCCPDE_S3").unwrap();
+        for (c, h) in entete.iter().enumerate() {
+            f3.write_string(0, c as u16, *h).unwrap();
+        }
+        lignes(f3, 1, &[("492/MH/1/0/0", "MH", 500.0)]);
+        let bytes = wb.save_to_buffer().unwrap();
+
+        let scan = ExcelProductionParser::scan_from_bytes(&bytes, "multi.xlsx").unwrap();
+        assert_eq!(scan.total_lignes, 6);
+        let pv492 = scan.points_vente.iter().find(|p| p.code == "492").unwrap();
+        assert_eq!(pv492.nombre_polices, 5);
+        assert_eq!(pv492.total_prime_nette, 1500.0);
+        assert!(scan.info_export.iter().any(|i| i.contains("GHARDAIA")));
+
+        let sel = ExcelSelection { point_vente: Some("492".into()), clients: vec![] };
+        let res = ExcelProductionParser::parse_from_bytes(&bytes, "multi.xlsx", &sel, Some(PeriodeBordereau { exercice: 2026, mois: Some(5) })).unwrap();
+        assert_eq!(res.items.len(), 5);
+        assert_eq!(res.total_prime_nette, 1500.0);
+        assert!(!res.anomalies.iter().any(|a| a.est_bloquante()), "{:?}", res.anomalies);
+        let clients = ExcelProductionParser::clients_from_bytes(&bytes, "492").unwrap();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].nombre_polices, 5);
+    }
+
+    /// Vrai export CIRIS « Detail Production Excel » (.xls) : feuilles de paramètres, en-tête en ligne 7,
+    /// 19 points de vente ; le préfixe du N° de police est le code de l'agence / AGA
+    #[test]
+    fn test_registre_ciris_reel_prod2026() {
+        let Some(bytes) = fichier_test("PROD2026.XLS") else { return };
+        let scan = ExcelProductionParser::scan_from_bytes(&bytes, "PROD2026.XLS").unwrap();
+        assert_eq!(scan.total_lignes, 61900);
+        assert_eq!(scan.points_vente.len(), 19);
+        assert!(scan.info_export.iter().any(|i| i.contains("SUCCURSALE GHARDAIA")), "{:?}", scan.info_export);
+        let pv492 = scan.points_vente.iter().find(|p| p.code == "492").unwrap();
+        assert_eq!(pv492.nombre_polices, 3516);
+        assert_eq!(pv492.total_prime_nette, 21533258.89);
+
+        // Tout le point de vente 492 sur l'exercice 2026
+        let sel = ExcelSelection { point_vente: Some("492".into()), clients: vec![] };
+        let annuel = ExcelProductionParser::parse_from_bytes(
+            &bytes,
+            "PROD2026.XLS",
+            &sel,
+            Some(PeriodeBordereau { exercice: 2026, mois: None }),
+        )
+        .unwrap();
+        assert!(!annuel.anomalies.iter().any(|a| a.est_bloquante()), "{:?}", annuel.anomalies);
+        assert_eq!(annuel.total_prime_nette, 21533258.89);
+        assert!(annuel.items.iter().all(|i| i.police.as_deref().unwrap().starts_with("492/")));
+        assert_eq!(annuel.code.as_deref(), Some("492"));
+
+        // Bordereau de mai 2026 : seules les polices émises en mai, le reste signalé hors période
+        let mai = ExcelProductionParser::parse_from_bytes(
+            &bytes,
+            "PROD2026.XLS",
+            &sel,
+            Some(PeriodeBordereau { exercice: 2026, mois: Some(5) }),
+        )
+        .unwrap();
+        assert!(mai.total_prime_nette > 0.0 && mai.total_prime_nette < annuel.total_prime_nette);
+        let hors = mai.anomalies.iter().find(|a| a.message.contains("hors de la période")).expect("hors période signalé");
+        assert!(hors.message.contains("05/2026"));
+
+        // Sans choix du point de vente : bloquant (19 agences mélangées)
+        let tout = ExcelProductionParser::parse_from_bytes(&bytes, "PROD2026.XLS", &ExcelSelection::default(), None).unwrap();
+        assert!(tout.anomalies.iter().any(|a| a.est_bloquante() && a.message.contains("points de vente")));
     }
 }

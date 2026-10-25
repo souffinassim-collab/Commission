@@ -30,6 +30,8 @@ import {
   BrancheParam,
   ExcelClientSummary,
   ExcelScanResult,
+  ExcelSelection,
+  PointVenteSummary,
   ImportContext,
   Intermediaire,
   UploadedFileResult,
@@ -40,6 +42,7 @@ import {
   AnomaliesPanel,
   anomaliesBloquantes,
   appliquerPolicesExclues,
+  AlerteDoubleFacturation,
   ConfirmDialog,
   ligneActive,
   PolicesPanel,
@@ -103,6 +106,18 @@ interface InterModalState {
   candidates?: InterCandidate[];
 }
 
+/** Fenêtre de sélection dans un registre Excel : point de vente, puis clients éventuels (courtier) */
+interface ExcelModalState {
+  scan: ExcelScanResult;
+  source: FileSource;
+  etape: 'points' | 'clients';
+  pv?: PointVenteSummary;
+  clients?: ExcelClientSummary[];
+  choisis: string[];
+  search: string;
+  chargement: boolean;
+}
+
 const ligneKey = (l: BordereauLigne) => `${l.code_garantie}|${l.libelle_garantie}|${l.branche_nom}`;
 
 export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSaved, onDirtyChange }) => {
@@ -133,12 +148,16 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
   const [confirm, setConfirm] = useState<ConfirmState | null>(null);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [openFile, setOpenFile] = useState<string | null>(null);
-  const [excelModal, setExcelModal] = useState<{ scan: ExcelScanResult; source: FileSource; search: string } | null>(null);
+  const [excelModal, setExcelModal] = useState<ExcelModalState | null>(null);
+  // Classeurs Excel analysés, conservés côté application le temps de la sélection
+  const classeursRef = useRef<string[]>([]);
+  const bordereauIdRef = useRef<number | undefined>(undefined);
   const [rateModal, setRateModal] = useState<RateModalState | null>(null);
   const [interModal, setInterModal] = useState<InterModalState | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const inter = intermediaires.find((i) => i.id === interId) || null;
+  bordereauIdRef.current = bordereau?.id;
   const locked = files.length > 0;
   const isCourtier = inter?.type_intermediaire === 'COURTIER';
 
@@ -175,7 +194,7 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
 
   useEffect(
     () => () => {
-      const ids = filesRef.current.map((f) => f.id);
+      const ids = [...filesRef.current.map((f) => f.id), ...classeursRef.current];
       if (ids.length) api.clearPendingFiles(ids).catch(() => {});
       onDirtyChange?.(false);
     },
@@ -192,6 +211,7 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
     try {
       const computed = await api.calculateMultiBordereau({
         files: list,
+        bordereau_id: bordereauIdRef.current,
         intermediaire_id: p.inter.id,
         type_intermediaire: p.inter.type_intermediaire,
         intermediaire_code: p.inter.code,
@@ -206,7 +226,7 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
       });
       setBordereau((prev) => {
         const base: Bordereau = prev?.id
-          ? { ...computed, id: prev.id, numero_bordereau: prev.numero_bordereau, statut: prev.statut, fichiers: prev.fichiers }
+          ? { ...computed, id: prev.id, numero_bordereau: prev.numero_bordereau, statut: prev.statut, fichiers: prev.fichiers, facture: prev.facture }
           : computed;
         const exclues = new Set((prev?.lignes || []).filter((l) => l.desactive).map(ligneKey));
         const lignes = appliquerPolicesExclues(
@@ -222,7 +242,8 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
   };
 
   const resetImport = async () => {
-    const ids = filesRef.current.map((f) => f.id);
+    const ids = [...filesRef.current.map((f) => f.id), ...classeursRef.current];
+    classeursRef.current = [];
     if (ids.length) await api.clearPendingFiles(ids).catch(() => {});
     setFiles([]);
     setBordereau(null);
@@ -242,32 +263,59 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
     ...overrides,
   });
 
-  const processSource = async (source: FileSource, clientOverride?: string, ctxOverride: Partial<ImportContext> = {}) => {
+  /**
+   * Import d'un fichier. Registre Excel : le classeur est d'abord analysé (points de vente) et la sélection
+   * se fait dans une fenêtre ; `excel` porte ensuite le classeur analysé et la sélection retenue.
+   */
+  const processSource = async (
+    source: FileSource,
+    excel?: { stagingId: string; selection: ExcelSelection },
+    ctxOverride: Partial<ImportContext> = {}
+  ) => {
     setLoading(true);
     setMessage(null);
     try {
-      const filter = clientOverride || paramsRef.current.clFilter || undefined;
-      if (isExcel(source.name) && !filter) {
+      if (isExcel(source.name) && !excel) {
         const scan =
           source.kind === 'path'
-            ? await api.scanExcelClients(source.path)
-            : await api.scanExcelClientsBase64(source.base64, source.name);
-        if (scan.multiple_clients) {
-          setExcelModal({ scan, source, search: '' });
+            ? await api.analyserClasseur(source.path)
+            : await api.analyserClasseurBase64(source.base64, source.name);
+        classeursRef.current = [...classeursRef.current, scan.staging_id];
+        if (scan.points_vente.length === 0) {
+          setMessage({ type: 'error', text: `Aucune police trouvée dans « ${scan.file_name} ».` });
           return;
         }
+        // AGA déjà choisi et présent dans le registre : tout son point de vente, sans autre question
+        const interCourant = paramsRef.current.inter;
+        const pvInter =
+          interCourant?.type_intermediaire === 'AGA'
+            ? scan.points_vente.find((p) => p.code.toUpperCase() === interCourant.code.trim().toUpperCase())
+            : undefined;
+        if (pvInter) {
+          setLoading(false);
+          await processSource(source, { stagingId: scan.staging_id, selection: { point_vente: pvInter.code, clients: [] } }, ctxOverride);
+          return;
+        }
+        const modal: ExcelModalState = { scan, source, etape: 'points', choisis: [], search: '', chargement: false };
+        setExcelModal(modal);
+        if (scan.points_vente.length === 1) await ouvrirClientsPointVente(modal, scan.points_vente[0]);
+        return;
       }
 
       const ctx = currentCtx(ctxOverride);
-      const res =
-        source.kind === 'path'
-          ? await api.parseFileAuto(source.path, ctx, filter)
-          : await api.parseFileAutoBase64(source.base64, source.name, ctx, filter);
+      const res = excel
+        ? await api.importerClasseur(excel.stagingId, excel.selection, ctx)
+        : source.kind === 'path'
+        ? await api.parseFileAuto(source.path, ctx)
+        : await api.parseFileAutoBase64(source.base64, source.name, ctx);
 
-      const doublon = filesRef.current.find((f) => f.hash === res.hash);
+      const doublon = filesRef.current.find((f) => f.hash === res.hash && (f.selection || '') === (res.selection || ''));
       if (doublon) {
         await api.clearPendingFiles([res.id]);
-        setMessage({ type: 'error', text: `Ce fichier est déjà inclus dans l'import en cours (« ${doublon.file_name} »).` });
+        setMessage({
+          type: 'error',
+          text: `Ce fichier${res.selection ? ` (${res.selection})` : ''} est déjà inclus dans l'import en cours.`,
+        });
         return;
       }
 
@@ -289,17 +337,18 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
         infoPeriode = ` Période du bordereau alignée sur le rapport : ${periodeLabel(ex, m)}.`;
       }
 
-      const memeNom = filesRef.current.find((f) => f.file_name === fichier.file_name);
+      const cle = (f: UploadedFileResult) => `${f.file_name}|${f.selection || ''}`;
+      const memeNom = filesRef.current.find((f) => cle(f) === cle(fichier));
       const commit = async () => {
         if (memeNom) await api.clearPendingFiles([memeNom.id]).catch(() => {});
-        const updated = [...filesRef.current.filter((f) => f.file_name !== fichier.file_name), fichier];
+        const updated = [...filesRef.current.filter((f) => cle(f) !== cle(fichier)), fichier];
         const overrides: Partial<Params> = {};
-        if (clientOverride) {
-          setClientFilter(clientOverride);
-          overrides.clFilter = clientOverride;
-        } else if (!paramsRef.current.clFilter && fichier.code && fichier.file_type !== 'CIRIS_PDF') {
-          setClientFilter(fichier.code);
-          overrides.clFilter = fichier.code;
+        // Clients retenus dans un registre (affaires d'un courtier) : repris comme code client du bordereau
+        const clientsRetenus = [...new Set(updated.flatMap((f) => f.clients_selectionnes || []))];
+        if (clientsRetenus.length) {
+          const cl = clientsRetenus.join(', ');
+          setClientFilter(cl);
+          overrides.clFilter = cl;
         }
         setFiles(updated);
         await recalculate(updated, overrides);
@@ -387,43 +436,26 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
     }
   };
 
-  const handleSelectClient = async (client: ExcelClientSummary) => {
-    if (!excelModal) return;
-    const source = excelModal.source;
-    setExcelModal(null);
-    const code = client.code_client?.trim();
-    const nom = client.designation_client?.trim() || code;
-    let interId: number | undefined = undefined;
-    if (code || nom) {
-      let liste = intermediaires;
-      try {
-        liste = await api.getIntermediaires();
-        setIntermediaires(liste);
-      } catch {}
-      let trouve = code ? liste.find((i) => i.code.trim().toUpperCase() === code.toUpperCase()) : undefined;
-      if (!trouve && nom) {
-        trouve = liste.find((i) => i.nom.trim().toUpperCase() === nom.toUpperCase());
-      }
-      if (trouve && trouve.actif) {
-        await choisirIntermediaire(trouve);
-        interId = trouve.id;
-      } else if (!trouve && code) {
-        try {
-          const id = await api.saveIntermediaire(nouvelIntermediaire('COURTIER', code, nom || code));
-          const maj = await api.getIntermediaires();
-          setIntermediaires(maj);
-          const cree = maj.find((i) => i.id === id);
-          if (cree) {
-            await choisirIntermediaire(cree);
-            interId = cree.id;
-          }
-        } catch (e) {
-          console.warn('Création auto intermédiaire client impossible :', e);
-        }
-      }
+  // --- Sélection dans un registre Excel : point de vente, puis clients éventuels (courtier) ---
+  const ouvrirClientsPointVente = async (modal: ExcelModalState, pv: PointVenteSummary) => {
+    setExcelModal({ ...modal, etape: 'clients', pv, clients: undefined, choisis: [], search: '', chargement: true });
+    try {
+      const clients = await api.clientsPointVente(modal.scan.staging_id, pv.code);
+      setExcelModal((m) => (m && m.pv?.code === pv.code ? { ...m, clients, chargement: false } : m));
+    } catch (e) {
+      setExcelModal(null);
+      setMessage({ type: 'error', text: errMsg(e) });
     }
-    await processSource(source, client.code_client, interId ? { intermediaire_id: interId } : {});
   };
+
+  const importerSelection = async (modal: ExcelModalState, selection: ExcelSelection) => {
+    setExcelModal(null);
+    await processSource(modal.source, { stagingId: modal.scan.staging_id, selection });
+  };
+
+  /** Intermédiaire enregistré dont le code est celui du point de vente */
+  const interDuPointVente = (code: string) =>
+    intermediaires.find((i) => i.code.trim().toUpperCase() === code.trim().toUpperCase());
 
   const handleRemoveFile = (f: UploadedFileResult) => {
     setConfirm({
@@ -568,57 +600,23 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
       /* liste courante */
     }
 
-    const type: Intermediaire['type_intermediaire'] = f.file_type === 'CIRIS_PDF' ? 'AGA' : 'COURTIER';
-    const prefixe = f.items.find((it) => it.police)?.police?.split('/')[0]?.replace(/\D/g, '') || '';
+    // Code lisible dans le fichier : agence du rapport CIRIS, ou point de vente d'un registre pris en entier (AGA).
+    // Les clients / assurés ne sont jamais des intermédiaires ; un courtier n'apparaît pas dans les fichiers.
+    const toutLePointDeVente = f.file_type === 'EXCEL_PRODUCTION' && !!f.point_vente && !(f.clients_selectionnes || []).length;
+    const code = (f.file_type === 'CIRIS_PDF' ? f.code : toutLePointDeVente ? f.point_vente : '')?.trim() || '';
+    const nom = f.file_type === 'CIRIS_PDF' ? f.courtier_ou_client?.trim() || '' : '';
 
-    // Collecter tous les candidats détectés dans le fichier
-    const rawCandidates: { code: string; nom: string }[] = [];
-    if (f.code || f.courtier_ou_client) {
-      const c = (f.code || '').trim();
-      const n = (f.courtier_ou_client || '').trim();
-      if (c || n) rawCandidates.push({ code: c, nom: n });
-    }
-    for (const it of f.items) {
-      const c = (it.client_code || '').trim();
-      const n = (it.client_nom || '').trim();
-      if (c || n) {
-        if (!rawCandidates.some((x) => x.code === c && x.nom === n)) {
-          rawCandidates.push({ code: c, nom: n });
-        }
+    if (code) {
+      const trouve = liste.find((i) => i.code.trim().toUpperCase() === code.toUpperCase());
+      if (trouve && trouve.actif) {
+        await choisirIntermediaire(trouve);
+        setMessage({ type: 'success', text: `Intermédiaire identifié : ${trouve.type_intermediaire} ${trouve.code} · ${trouve.nom}.` });
+        return;
       }
-    }
-
-    // Associer les candidats aux intermédiaires existants en base si trouvés
-    const candidates: InterCandidate[] = rawCandidates.map((c) => {
-      const match =
-        (c.code ? liste.find((i) => i.code.trim().toUpperCase() === c.code.toUpperCase()) : undefined) ||
-        (c.nom ? liste.find((i) => i.nom.trim().toUpperCase() === c.nom.toUpperCase()) : undefined) ||
-        (prefixe ? liste.find((i) => i.type_intermediaire === type && i.code.replace(/\D/g, '') === prefixe) : undefined);
-      return {
-        code: c.code || (match ? match.code : prefixe || ''),
-        nom: c.nom || (match ? match.nom : c.code || (type === 'AGA' ? 'Agence' : 'Courtier')),
-        type,
-        source: f.file_name,
-        existingId: match?.id,
-      };
-    });
-
-    // S'il y a un candidat clair
-    const primary = candidates[0];
-    if (primary) {
-      if (primary.existingId) {
-        const trouve = liste.find((i) => i.id === primary.existingId);
-        if (trouve && trouve.actif) {
-          await choisirIntermediaire(trouve);
-          setMessage({
-            type: 'success',
-            text: `Intermédiaire identifié automatiquement : ${trouve.type_intermediaire} ${trouve.code} · ${trouve.nom}.`,
-          });
-          return;
-        }
-      } else if (primary.code) {
+      // Rapport CIRIS d'une agence inconnue : code et nom figurent dans le PDF, la fiche est créée
+      if (!trouve && nom) {
         try {
-          const id = await api.saveIntermediaire(nouvelIntermediaire(type, primary.code, primary.nom || primary.code));
+          const id = await api.saveIntermediaire(nouvelIntermediaire('AGA', code, nom));
           const maj = await api.getIntermediaires();
           setIntermediaires(maj);
           const cree = maj.find((i) => i.id === id);
@@ -626,35 +624,42 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
             await choisirIntermediaire(cree);
             setMessage({
               type: 'success',
-              text: `Nouvel intermédiaire créé automatiquement : ${cree.type_intermediaire} ${cree.code} · ${cree.nom} (fiche modifiable dans « Intermédiaires »).`,
+              text: `Nouvel intermédiaire créé automatiquement : AGA ${cree.code} · ${cree.nom} (fiche modifiable dans « Intermédiaires »).`,
             });
             return;
           }
         } catch (e) {
-          console.warn('Création auto de l’intermédiaire impossible :', e);
+          setMessage({ type: 'error', text: `Création automatique de l'intermédiaire impossible : ${errMsg(e)}` });
         }
       }
+      setInterModal(
+        (prev) =>
+          prev ?? {
+            mode: trouve ? 'choisir' : 'creer',
+            raison: trouve
+              ? `« ${f.file_name} » concerne ${trouve.code} (${trouve.nom}), mais cet intermédiaire est désactivé.`
+              : `Le point de vente ${code} de « ${f.file_name} » n'est pas encore dans le répertoire. Indiquez son nom et son type pour l'enregistrer.`,
+            selectedId: trouve?.id,
+            form: nouvelIntermediaire('AGA', code, nom),
+            candidates: trouve ? [{ code: trouve.code, nom: trouve.nom, type: trouve.type_intermediaire, source: f.file_name, existingId: trouve.id }] : [],
+          }
+      );
+      return;
     }
 
-    // Si sélection manuelle / validation requise : modal avec sélection en 1 clic
-    const suggestion = prefixe
-      ? liste.find((i) => i.actif && i.type_intermediaire === 'COURTIER' && i.code.replace(/\D/g, '') === prefixe)
-      : undefined;
-    const defaultCode = primary?.code || prefixe || '';
-    const defaultNom = primary?.nom || f.courtier_ou_client?.trim() || '';
-
+    // Affaires d'un courtier (clients choisis dans un registre) ou PDF de flotte : le courtier est demandé
+    const clients = (f.clients_selectionnes || []).length
+      ? ` (client(s) : ${f.courtier_ou_client || (f.clients_selectionnes || []).join(', ')})`
+      : f.courtier_ou_client
+      ? ` (assuré : ${f.courtier_ou_client})`
+      : '';
     setInterModal(
       (prev) =>
         prev ?? {
-          mode: candidates.some((c) => c.existingId) || liste.some((i) => i.actif) ? 'choisir' : 'creer',
-          raison: candidates.length > 0
-            ? `Intermédiaire(s) détecté(s) dans « ${f.file_name} ». Choisissez l'intermédiaire ou sélectionnez-le directement ci-dessous.`
-            : `Le fichier « ${f.file_name} » (${FILE_TYPE_LABEL[f.file_type] || f.file_type}) n'indique pas clairement le courtier${
-                f.courtier_ou_client ? ` (client : ${f.courtier_ou_client})` : ''
-              }. Indiquez le code du courtier concerné.`,
-          selectedId: primary?.existingId || suggestion?.id,
-          form: nouvelIntermediaire(type, defaultCode, defaultNom),
-          candidates,
+          mode: liste.some((i) => i.actif && i.type_intermediaire === 'COURTIER') ? 'choisir' : 'creer',
+          raison: `« ${f.file_name} »${clients} : ces affaires sont apportées par un courtier, qui n'est pas indiqué dans le fichier. Choisissez-le ou créez sa fiche.`,
+          form: nouvelIntermediaire('COURTIER'),
+          candidates: [],
         }
     );
   };
@@ -824,12 +829,6 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
   const inputCls =
     'w-full bg-slate-50 border border-slate-200 rounded-lg p-2 font-medium text-slate-800 focus:ring-2 focus:ring-indigo-500 focus:outline-hidden disabled:opacity-60 disabled:cursor-not-allowed';
 
-  const filteredClients =
-    excelModal?.scan.clients.filter((c) => {
-      const q = excelModal.search.toLowerCase();
-      return c.code_client.toLowerCase().includes(q) || c.designation_client.toLowerCase().includes(q);
-    }) || [];
-
   return (
     <div className="space-y-6 pb-12">
       <div className="bg-gradient-to-r from-indigo-900 via-indigo-800 to-slate-900 rounded-2xl p-6 text-white shadow-xl">
@@ -953,15 +952,10 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
               </select>
             </div>
             <div>
-              <label className="block font-semibold text-slate-600 mb-1">Filtre client (Excel)</label>
-              <input
-                type="text"
-                value={clientFilter}
-                disabled={locked}
-                onChange={(e) => setClientFilter(e.target.value)}
-                placeholder="Code ou nom"
-                className={inputCls}
-              />
+              <label className="block font-semibold text-slate-600 mb-1">Clients (registre Excel)</label>
+              <div className={`${inputCls} truncate text-slate-500`} title={clientFilter || 'Choisis lors de l’import du registre'}>
+                {clientFilter || 'Tout le point de vente'}
+              </div>
             </div>
           </div>
 
@@ -1056,6 +1050,7 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
                         {f.courtier_ou_client && <>Client : <strong>{f.courtier_ou_client}</strong> </>}
                         {f.code && <>({f.code}) </>}
                         {f.periode && <>• Période {f.periode} </>}• {f.items.length} lignes
+                        {f.selection && <div className="text-indigo-700 font-semibold">{f.selection}</div>}
                       </div>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
@@ -1214,6 +1209,7 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
             </details>
           )}
 
+          <AlerteDoubleFacturation lignes={bordereau.lignes} />
           <PolicesPanel lignes={bordereau.lignes} onToggle={togglePolices} />
 
           <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
@@ -1347,62 +1343,181 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
         </div>
       )}
 
-      {/* Choix du client dans un registre Excel multi-clients */}
-      {excelModal && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden">
-            <div className="px-6 py-4 flex items-center justify-between bg-gradient-to-r from-indigo-900 to-slate-900 text-white">
-              <div className="flex items-center gap-2 font-bold">
-                <UserCheck className="w-5 h-5 text-amber-400" /> {excelModal.scan.clients.length} clients dans « {excelModal.scan.file_name} »
-              </div>
-              <button type="button" onClick={() => setExcelModal(null)} className="cursor-pointer">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-            <div className="p-4 border-b border-slate-100 relative">
-              <Search className="w-4 h-4 text-slate-400 absolute left-7 top-1/2 -translate-y-1/2" />
-              <input
-                autoFocus
-                value={excelModal.search}
-                onChange={(e) => setExcelModal({ ...excelModal, search: e.target.value })}
-                placeholder="Rechercher un client (nom ou code)…"
-                className="w-full border border-slate-200 rounded-xl pl-9 pr-4 py-2.5 text-xs"
-              />
-              <p className="text-[11px] text-slate-500 mt-2">
-                Un client par code (polices regroupées). Double-cliquez sur un client : il devient l'intermédiaire du bordereau.
-              </p>
-            </div>
-            <div className="overflow-y-auto flex-1 p-4 divide-y divide-slate-100">
-              {filteredClients.slice(0, 100).map((c) => (
-                <div
-                  key={c.code_client}
-                  onDoubleClick={() => handleSelectClient(c)}
-                  title="Double-cliquez pour sélectionner"
-                  className="py-2.5 px-2 rounded-lg flex items-center justify-between text-xs cursor-pointer hover:bg-indigo-50 select-none"
-                >
-                  <div>
-                    <div className="font-bold text-slate-900">{c.designation_client || 'Sans désignation'}</div>
-                    <div className="text-slate-500 font-mono">
-                      {c.code_client} • {c.nombre_polices} police(s)
-                    </div>
+      {/* Sélection dans un registre de production : point de vente, puis clients (affaires d'un courtier) */}
+      {excelModal && (() => {
+        const m = excelModal;
+        const q = m.search.trim().toLowerCase();
+        const points = m.scan.points_vente.filter((p) => {
+          const i = interDuPointVente(p.code);
+          return !q || p.code.toLowerCase().includes(q) || (i?.nom || '').toLowerCase().includes(q);
+        });
+        const clients = (m.clients || []).filter(
+          (c) => !q || c.code_client.toLowerCase().includes(q) || c.designation_client.toLowerCase().includes(q)
+        );
+        const basculer = (code: string) =>
+          setExcelModal({ ...m, choisis: m.choisis.includes(code) ? m.choisis.filter((c) => c !== code) : [...m.choisis, code] });
+        return (
+          <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col overflow-hidden">
+              <div className="px-6 py-4 flex items-center justify-between bg-gradient-to-r from-indigo-900 to-slate-900 text-white">
+                <div>
+                  <div className="flex items-center gap-2 font-bold">
+                    <UserCheck className="w-5 h-5 text-amber-400" />
+                    {m.etape === 'points'
+                      ? `« ${m.scan.file_name} » — ${m.scan.points_vente.length} point(s) de vente`
+                      : `Point de vente ${m.pv?.code}${m.pv && interDuPointVente(m.pv.code) ? ` · ${interDuPointVente(m.pv.code)?.nom}` : ''}`}
                   </div>
-                  <div className="flex items-center gap-3">
-                    <span className="font-mono font-bold">{formatDZD(c.total_prime_nette)}</span>
+                  <div className="text-[11px] text-indigo-200 mt-0.5">
+                    {m.scan.total_lignes.toLocaleString('fr-DZ')} lignes
+                    {m.scan.periode_emission && ` • émissions ${m.scan.periode_emission}`}
+                    {m.scan.info_export.length > 0 && ` • ${m.scan.info_export.join(' • ')}`}
+                  </div>
+                </div>
+                <button type="button" onClick={() => setExcelModal(null)} className="cursor-pointer">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-4 border-b border-slate-100 space-y-2">
+                <div className="relative">
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    autoFocus
+                    value={m.search}
+                    onChange={(e) => setExcelModal({ ...m, search: e.target.value })}
+                    placeholder={m.etape === 'points' ? 'Rechercher un point de vente (code ou nom)…' : 'Rechercher un client (nom ou code)…'}
+                    className="w-full border border-slate-200 rounded-xl pl-9 pr-4 py-2.5 text-xs"
+                  />
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  {m.etape === 'points'
+                    ? "Le point de vente est le préfixe du N° de police. AGA : double-cliquez pour prendre tout son portefeuille. Courtier : « Choisir des clients » puis cochez les affaires qu'il a apportées."
+                    : `Période retenue : ${periodeLabel(exercice, mois)} (date d'émission). Double-cliquez sur un client pour l'importer seul, ou cochez plusieurs clients.`}
+                </p>
+              </div>
+
+              <div className="overflow-y-auto flex-1 p-3 divide-y divide-slate-100 text-xs">
+                {m.etape === 'points' &&
+                  points.map((p) => {
+                    const i = interDuPointVente(p.code);
+                    return (
+                      <div
+                        key={p.code}
+                        onDoubleClick={() =>
+                          i?.type_intermediaire === 'COURTIER' ? ouvrirClientsPointVente(m, p) : importerSelection(m, { point_vente: p.code, clients: [] })
+                        }
+                        title="Double-clic : tout le point de vente"
+                        className="py-2.5 px-2 rounded-lg flex items-center justify-between gap-3 cursor-pointer hover:bg-indigo-50 select-none"
+                      >
+                        <div className="min-w-0">
+                          <div className="font-bold text-slate-900">
+                            <span className="font-mono text-indigo-800">{p.code}</span>
+                            {i ? (
+                              <span>
+                                {' '}· {i.nom} <span className="text-[10px] text-slate-500">({i.type_intermediaire})</span>
+                              </span>
+                            ) : (
+                              <span className="text-[10px] font-semibold text-amber-700"> · non enregistré</span>
+                            )}
+                          </div>
+                          <div className="text-slate-500 truncate">
+                            {p.nombre_polices.toLocaleString('fr-DZ')} police(s) • {p.nombre_clients.toLocaleString('fr-DZ')} client(s) • branches{' '}
+                            {p.branches.join(', ')}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span className="font-mono font-bold">{formatDZD(p.total_prime_nette)}</span>
+                          <button
+                            type="button"
+                            onClick={() => ouvrirClientsPointVente(m, p)}
+                            className="px-2.5 py-1.5 rounded-lg bg-white border border-slate-300 hover:bg-slate-100 font-bold cursor-pointer"
+                          >
+                            Choisir des clients
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => importerSelection(m, { point_vente: p.code, clients: [] })}
+                            className="px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-bold cursor-pointer"
+                          >
+                            Tout le point de vente
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                {m.etape === 'clients' && m.chargement && <div className="py-10 text-center text-slate-400">Lecture des clients…</div>}
+                {m.etape === 'clients' &&
+                  !m.chargement &&
+                  clients.slice(0, 300).map((c) => (
+                    <label
+                      key={c.code_client}
+                      onDoubleClick={(e) => {
+                        e.preventDefault();
+                        importerSelection(m, { point_vente: m.pv?.code, clients: [c.code_client] });
+                      }}
+                      className={`py-2 px-2 rounded-lg flex items-center justify-between gap-3 cursor-pointer select-none ${
+                        m.choisis.includes(c.code_client) ? 'bg-indigo-50' : 'hover:bg-slate-50'
+                      }`}
+                    >
+                      <span className="flex items-center gap-2 min-w-0">
+                        <input type="checkbox" checked={m.choisis.includes(c.code_client)} onChange={() => basculer(c.code_client)} />
+                        <span className="min-w-0">
+                          <span className="font-bold text-slate-900 block truncate">{c.designation_client || 'Sans désignation'}</span>
+                          <span className="text-slate-500 font-mono">
+                            {c.code_client} • {c.nombre_polices} police(s)
+                          </span>
+                        </span>
+                      </span>
+                      <span className="font-mono font-bold shrink-0">{formatDZD(c.total_prime_nette)}</span>
+                    </label>
+                  ))}
+                {m.etape === 'clients' && !m.chargement && clients.length > 300 && (
+                  <div className="py-3 text-center text-slate-400">
+                    {clients.length - 300} autre(s) client(s) : affinez la recherche.
+                  </div>
+                )}
+                {((m.etape === 'points' && points.length === 0) || (m.etape === 'clients' && !m.chargement && clients.length === 0)) && (
+                  <div className="py-10 text-center text-slate-400">Aucun résultat.</div>
+                )}
+              </div>
+
+              {m.etape === 'clients' && m.pv && (
+                <div className="px-6 py-3 border-t border-slate-100 bg-slate-50 flex flex-wrap items-center justify-between gap-2 text-xs">
+                  {m.scan.points_vente.length > 1 ? (
                     <button
                       type="button"
-                      onClick={() => handleSelectClient(c)}
-                      className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-bold cursor-pointer"
+                      onClick={() => setExcelModal({ ...m, etape: 'points', pv: undefined, clients: undefined, choisis: [], search: '' })}
+                      className="px-3 py-2 rounded-lg bg-white border border-slate-300 font-bold cursor-pointer"
                     >
-                      Sélectionner
+                      ← Points de vente
+                    </button>
+                  ) : (
+                    <span />
+                  )}
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => importerSelection(m, { point_vente: m.pv!.code, clients: [] })}
+                      className="px-3 py-2 rounded-lg bg-white border border-indigo-300 text-indigo-700 font-bold cursor-pointer"
+                    >
+                      Tout le point de vente {m.pv.code}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={m.choisis.length === 0}
+                      onClick={() => importerSelection(m, { point_vente: m.pv!.code, clients: m.choisis })}
+                      className="px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white font-bold cursor-pointer"
+                    >
+                      Importer {m.choisis.length || ''} client(s) sélectionné(s)
                     </button>
                   </div>
                 </div>
-              ))}
-              {filteredClients.length === 0 && <div className="py-10 text-center text-slate-400 text-xs">Aucun client trouvé.</div>}
+              )}
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Paramétrage d'un taux manquant */}
       {rateModal && (

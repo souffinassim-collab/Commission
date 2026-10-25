@@ -8,14 +8,17 @@ use crate::calculation::CalculationEngine;
 use crate::db::{DatabaseManager, ImportAEnregistrer};
 use crate::export::ExcelExporter;
 use crate::models::{
-    Anomalie, Bordereau, BrancheParam, CalculateMultiBordereauRequest, DbInfo, ExcelScanResult, Intermediaire,
-    UploadedFileResult,
+    Anomalie, Bordereau, BrancheParam, CalculateMultiBordereauRequest, DbInfo, ExcelClientSummary, ExcelScanResult,
+    Intermediaire, UploadedFileResult,
 };
-use crate::parser::{extract_pages, CirisPdfParser, ExcelProductionParser, FlottePdfParser};
+use crate::parser::{
+    extract_pages, CirisPdfParser, ExcelProductionParser, ExcelSelection, FlottePdfParser, PeriodeBordereau,
+};
 
 /// Fichier analysé en attente d'enregistrement (contenu conservé jusqu'à l'enregistrement du bordereau)
 pub struct FichierEnAttente {
     pub contenu: Vec<u8>,
+    pub nom: String,
 }
 
 pub struct AppState {
@@ -67,12 +70,13 @@ fn file_name_of(path: &str) -> String {
 fn parse_file_auto_bytes(
     bytes: &[u8],
     file_name: &str,
-    client_filter: Option<&str>,
+    selection: &ExcelSelection,
+    periode: Option<PeriodeBordereau>,
     known_codes: &[String],
 ) -> Result<UploadedFileResult, String> {
     let lower = file_name.to_lowercase();
     if lower.ends_with(".xlsx") || lower.ends_with(".xls") {
-        ExcelProductionParser::parse_from_bytes(bytes, file_name, client_filter)
+        ExcelProductionParser::parse_from_bytes(bytes, file_name, selection, periode)
     } else if lower.ends_with(".pdf") {
         let doc = lopdf::Document::load_mem(bytes).map_err(|e| format!("Erreur lecture PDF: {:?}", e))?;
         let pages = extract_pages(&doc);
@@ -102,11 +106,15 @@ fn validate_against_context(
     ctx: &ImportContext,
 ) -> Result<(), String> {
     res.anomalies_contexte.clear();
-    if let Some((_, num)) = db.find_hash_usage(&res.hash, ctx.bordereau_id)? {
-        res.anomalies_contexte.push(Anomalie::erreur(format!(
-            "Ce fichier a déjà été importé dans le bordereau {} : il ne peut pas être commissionné deux fois.",
-            num
-        )));
+    // Rapport CIRIS (totaux sans N° de police) : contrôle sur le fichier lui-même. Les autres fichiers
+    // peuvent servir à plusieurs bordereaux ; le contrôle porte alors sur les polices (voir le calcul).
+    if res.file_type == "CIRIS_PDF" {
+        if let Some((_, num)) = db.find_hash_usage(&res.hash, ctx.bordereau_id)? {
+            res.anomalies_contexte.push(Anomalie::erreur(format!(
+                "Ce fichier a déjà été importé dans le bordereau {} : il ne peut pas être commissionné deux fois.",
+                num
+            )));
+        }
     }
     let inter = match ctx.intermediaire_id {
         Some(id) => db.get_intermediaire(id)?.ok_or_else(|| format!("Intermédiaire #{} introuvable.", id))?,
@@ -181,12 +189,13 @@ fn analyse_et_met_en_attente(
     state: &State<'_, AppState>,
     bytes: Vec<u8>,
     file_name: &str,
-    client_filter: Option<&str>,
+    selection: &ExcelSelection,
     ctx: &ImportContext,
 ) -> Result<UploadedFileResult, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let known = db.known_sous_codes()?;
-    let mut res = parse_file_auto_bytes(&bytes, file_name, client_filter, &known)?;
+    let periode = Some(PeriodeBordereau { exercice: ctx.exercice, mois: ctx.mois });
+    let mut res = parse_file_auto_bytes(&bytes, file_name, selection, periode, &known)?;
     res.hash = sha256_hex(&bytes);
     res.taille = bytes.len() as i64;
     validate_against_context(&db, &mut res, ctx)?;
@@ -195,7 +204,7 @@ fn analyse_et_met_en_attente(
         .en_attente
         .lock()
         .map_err(|e| e.to_string())?
-        .insert(res.id.clone(), FichierEnAttente { contenu: bytes });
+        .insert(res.id.clone(), FichierEnAttente { contenu: bytes, nom: file_name.to_string() });
     Ok(res)
 }
 
@@ -239,6 +248,26 @@ pub fn delete_branche(id: i64, state: State<'_, AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
+pub fn get_categories(state: State<'_, AppState>) -> Result<Vec<crate::models::Categorie>, String> {
+    state.db.lock().map_err(|e| e.to_string())?.get_categories()
+}
+
+#[tauri::command]
+pub fn save_categorie(categorie: crate::models::Categorie, state: State<'_, AppState>) -> Result<i64, String> {
+    state.db.lock().map_err(|e| e.to_string())?.save_categorie(&categorie)
+}
+
+#[tauri::command]
+pub fn delete_categorie(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    state.db.lock().map_err(|e| e.to_string())?.delete_categorie(id)
+}
+
+#[tauri::command]
+pub fn affecter_categorie(branche_ids: Vec<i64>, categorie_id: Option<i64>, state: State<'_, AppState>) -> Result<(), String> {
+    state.db.lock().map_err(|e| e.to_string())?.affecter_categorie(&branche_ids, categorie_id)
+}
+
+#[tauri::command]
 pub fn reset_branches_to_default(state: State<'_, AppState>) -> Result<Vec<BrancheParam>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.reset_branches_to_default()?;
@@ -269,38 +298,85 @@ pub fn delete_intermediaire(id: i64, state: State<'_, AppState>) -> Result<(), S
 // ---------------------------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn scan_excel_clients(file_path: String) -> Result<ExcelScanResult, String> {
-    let bytes = fs::read(&file_path).map_err(|e| format!("Impossible de lire le fichier: {}", e))?;
-    ExcelProductionParser::scan_clients_from_bytes(&bytes, &file_name_of(&file_path))
-}
-
-#[tauri::command]
-pub fn scan_excel_clients_base64(base64_data: String, file_name: String) -> Result<ExcelScanResult, String> {
-    let bytes = decode_base64_payload(&base64_data)?;
-    ExcelProductionParser::scan_clients_from_bytes(&bytes, &file_name)
-}
-
-#[tauri::command]
 pub fn parse_file_auto(
     file_path: String,
-    client_filter: Option<String>,
+    selection: Option<ExcelSelection>,
     ctx: ImportContext,
     state: State<'_, AppState>,
 ) -> Result<UploadedFileResult, String> {
     let bytes = fs::read(&file_path).map_err(|e| format!("Impossible de lire le fichier: {}", e))?;
-    analyse_et_met_en_attente(&state, bytes, &file_name_of(&file_path), client_filter.as_deref(), &ctx)
+    analyse_et_met_en_attente(&state, bytes, &file_name_of(&file_path), &selection.unwrap_or_default(), &ctx)
 }
 
 #[tauri::command]
 pub fn parse_file_auto_base64(
     base64_data: String,
     file_name: String,
-    client_filter: Option<String>,
+    selection: Option<ExcelSelection>,
     ctx: ImportContext,
     state: State<'_, AppState>,
 ) -> Result<UploadedFileResult, String> {
     let bytes = decode_base64_payload(&base64_data)?;
-    analyse_et_met_en_attente(&state, bytes, &file_name, client_filter.as_deref(), &ctx)
+    analyse_et_met_en_attente(&state, bytes, &file_name, &selection.unwrap_or_default(), &ctx)
+}
+
+/// Registre Excel : analyse (points de vente) ; le classeur reste en mémoire pour la sélection
+fn analyser_et_garder(state: &State<'_, AppState>, bytes: Vec<u8>, file_name: &str) -> Result<ExcelScanResult, String> {
+    let mut scan = ExcelProductionParser::scan_from_bytes(&bytes, file_name)?;
+    scan.staging_id = format!("classeur-{}", chrono::Local::now().timestamp_micros());
+    state
+        .en_attente
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(scan.staging_id.clone(), FichierEnAttente { contenu: bytes, nom: file_name.to_string() });
+    Ok(scan)
+}
+
+fn classeur_en_attente(state: &State<'_, AppState>, staging_id: &str) -> Result<(Vec<u8>, String), String> {
+    let map = state.en_attente.lock().map_err(|e| e.to_string())?;
+    let f = map
+        .get(staging_id)
+        .ok_or_else(|| "Le classeur n'est plus en mémoire : réimportez le fichier.".to_string())?;
+    Ok((f.contenu.clone(), f.nom.clone()))
+}
+
+#[tauri::command]
+pub fn analyser_classeur(file_path: String, state: State<'_, AppState>) -> Result<ExcelScanResult, String> {
+    let bytes = fs::read(&file_path).map_err(|e| format!("Impossible de lire le fichier: {}", e))?;
+    analyser_et_garder(&state, bytes, &file_name_of(&file_path))
+}
+
+#[tauri::command]
+pub fn analyser_classeur_base64(
+    base64_data: String,
+    file_name: String,
+    state: State<'_, AppState>,
+) -> Result<ExcelScanResult, String> {
+    let bytes = decode_base64_payload(&base64_data)?;
+    analyser_et_garder(&state, bytes, &file_name)
+}
+
+/// Clients d'un point de vente du classeur analysé (un par code, sans doublon)
+#[tauri::command]
+pub fn clients_point_vente(
+    staging_id: String,
+    point_vente: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ExcelClientSummary>, String> {
+    let (bytes, _) = classeur_en_attente(&state, &staging_id)?;
+    ExcelProductionParser::clients_from_bytes(&bytes, &point_vente)
+}
+
+/// Import de la sélection faite dans le classeur analysé (point de vente, clients éventuels)
+#[tauri::command]
+pub fn importer_classeur(
+    staging_id: String,
+    selection: ExcelSelection,
+    ctx: ImportContext,
+    state: State<'_, AppState>,
+) -> Result<UploadedFileResult, String> {
+    let (bytes, nom) = classeur_en_attente(&state, &staging_id)?;
+    analyse_et_met_en_attente(&state, bytes, &nom, &selection, &ctx)
 }
 
 /// Abandon de l'import en cours : libère les fichiers en attente
@@ -320,7 +396,8 @@ pub fn calculate_multi_bordereau(
 ) -> Result<Bordereau, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let branches = db.get_all_branches()?;
-    Ok(CalculationEngine::compute_multi_bordereau(&req, &branches))
+    let deja = db.polices_commissionnees(req.bordereau_id)?;
+    Ok(CalculationEngine::compute_multi_bordereau(&req, &branches, &deja))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -468,6 +545,38 @@ pub fn export_excel(
     Ok(target_path.to_string_lossy().to_string())
 }
 
+// ---------------------------------------------------------------------------------------------
+// Détail de production : facture de l'intermédiaire, rapprochement et écarts
+// ---------------------------------------------------------------------------------------------
+
+/// Détail de production à confirmer (détail par police, commission calculée / déclarée, écarts)
+#[tauri::command]
+pub fn detail_production(bordereau: Bordereau) -> Result<crate::detail::DetailProduction, String> {
+    Ok(crate::detail::construire(&bordereau))
+}
+
+/// Enregistre la facture de l'intermédiaire (numéro, date, commission HT déclarée par ligne)
+#[tauri::command]
+pub fn enregistrer_facture_intermediaire(
+    bordereau_id: i64,
+    facture: Option<crate::models::FactureIntermediaire>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.db.lock().map_err(|e| e.to_string())?.enregistrer_facture(bordereau_id, facture.as_ref())
+}
+
+/// Export Excel du détail de production (même présentation que le modèle du service commercial)
+#[tauri::command]
+pub fn export_detail_production(bordereau: Bordereau, state: State<'_, AppState>) -> Result<String, String> {
+    let d = crate::detail::construire(&bordereau);
+    let path = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.exports_directory().join(format!("Detail_production_{}.xlsx", safe_name(&bordereau.numero_bordereau)))
+    };
+    ExcelExporter::export_detail_production(&d, &path).map_err(|e| format!("Erreur export Excel: {:?}", e))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,7 +587,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("commissions_ctx_{}", std::process::id()));
         let db = DatabaseManager::with_path(dir.join("BDD").join("commissions.db")).unwrap();
         let known = db.known_sous_codes().unwrap();
-        let mut f = parse_file_auto_bytes(&bytes, "05-2025.PDF", None, &known).unwrap();
+        let mut f = parse_file_auto_bytes(&bytes, "05-2025.PDF", &ExcelSelection::default(), None, &known).unwrap();
         f.hash = sha256_hex(&bytes);
         let nouvel = |code: &str, t: &str| {
             db.save_intermediaire(&Intermediaire {
@@ -517,12 +626,12 @@ mod tests {
     fn test_auto_detection_des_pdf() {
         let known = crate::parser::tests::known();
         if let Ok(bytes) = std::fs::read("../Import/05-2025.PDF") {
-            let res = parse_file_auto_bytes(&bytes, "05-2025.PDF", None, &known).expect("parse CIRIS");
+            let res = parse_file_auto_bytes(&bytes, "05-2025.PDF", &ExcelSelection::default(), None, &known).expect("parse CIRIS");
             assert_eq!(res.file_type, "CIRIS_PDF");
             assert_eq!(res.items.len(), 17);
         }
         if let Ok(bytes) = std::fs::read("../Import/RCCDVF.pdf") {
-            let res = parse_file_auto_bytes(&bytes, "RCCDVF.pdf", None, &known).expect("parse flotte");
+            let res = parse_file_auto_bytes(&bytes, "RCCDVF.pdf", &ExcelSelection::default(), None, &known).expect("parse flotte");
             assert_eq!(res.file_type, "FLOTTE_PDF");
         }
     }

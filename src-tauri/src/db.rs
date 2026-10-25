@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use chrono::Local;
 use rusqlite::{params, Connection, OptionalExtension};
 use crate::calculation::alias_list;
 use crate::models::{
-    Anomalie, Bordereau, BordereauLigne, BrancheParam, DbInfo, FichierBordereau, Intermediaire, UploadedFileResult,
+    Anomalie, Bordereau, BordereauLigne, BrancheParam, Categorie, DbInfo, FichierBordereau, Intermediaire,
+    UploadedFileResult,
 };
 
 /// Résultat des opérations BDD : les erreurs sont des messages lisibles par l'utilisateur
@@ -19,9 +21,21 @@ pub struct DatabaseManager {
 }
 
 /// Dernière version de schéma connue (à incrémenter à chaque nouvelle migration)
-const LATEST_SCHEMA_VERSION: i32 = 4;
+const LATEST_SCHEMA_VERSION: i32 = 7;
 
 pub const STATUTS_BORDEREAU: [&str; 3] = ["BROUILLON", "VALIDE", "REGLE"];
+
+/// Catégories proposées à l'origine et règle de classement initial (premier segment du code ministériel)
+const CATEGORIES_INITIALES: [(&str, &str); 5] = [
+    ("Automobile", "code LIKE '3.%'"),
+    ("Transport & Maritime", "code LIKE '4.%' OR code LIKE '5.%' OR code LIKE '6.%' OR code LIKE '7.%'"),
+    ("Agricole", "LOWER(branche) LIKE '%agricole%'"),
+    (
+        "Incendie & Risques Divers",
+        "code LIKE '2.%' OR code LIKE '8.%' OR code LIKE '9.%' OR code LIKE '16.%' OR code = '16'",
+    ),
+    ("Responsabilité Civile", "code LIKE '10.%' OR code LIKE '11.%' OR code LIKE '12.%' OR code LIKE '13.%'"),
+];
 
 /// Fichier d'import à rattacher à un bordereau lors de l'enregistrement
 pub struct ImportAEnregistrer<'a> {
@@ -305,6 +319,105 @@ impl DatabaseManager {
             tx.commit().map_err(db_err)?;
         }
 
+        // Migration V5: contenu des fichiers stocké une seule fois (un même registre peut servir à plusieurs
+        // bordereaux, un par point de vente) + sélection retenue dans le fichier
+        if current_version < 5 {
+            let tx = conn.transaction().map_err(db_err)?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS fichiers_contenu (
+                    hash TEXT PRIMARY KEY,
+                    contenu BLOB NOT NULL
+                );",
+            )
+            .map_err(db_err)?;
+            if Self::column_exists(&tx, "bordereau_fichiers", "contenu")? {
+                tx.execute_batch(
+                    "INSERT OR IGNORE INTO fichiers_contenu (hash, contenu) SELECT hash, contenu FROM bordereau_fichiers;
+                     ALTER TABLE bordereau_fichiers DROP COLUMN contenu;",
+                )
+                .map_err(db_err)?;
+            }
+            if !Self::column_exists(&tx, "bordereau_fichiers", "selection")? {
+                tx.execute("ALTER TABLE bordereau_fichiers ADD COLUMN selection TEXT;", []).map_err(db_err)?;
+            }
+            tx.execute(
+                "INSERT INTO _migrations (version, name, applied_at) VALUES (5, 'contenu_fichiers_mutualise_selection', ?1)",
+                params![now()],
+            )
+            .map_err(db_err)?;
+            tx.commit().map_err(db_err)?;
+        }
+
+        // Migration V6: facture de l'intermédiaire saisie pour confirmation (rapprochement avec le calcul)
+        if current_version < 6 {
+            let tx = conn.transaction().map_err(db_err)?;
+            if !Self::column_exists(&tx, "bordereaux", "facture_json")? {
+                tx.execute("ALTER TABLE bordereaux ADD COLUMN facture_json TEXT;", []).map_err(db_err)?;
+            }
+            tx.execute(
+                "INSERT INTO _migrations (version, name, applied_at) VALUES (6, 'facture_intermediaire', ?1)",
+                params![now()],
+            )
+            .map_err(db_err)?;
+            tx.commit().map_err(db_err)?;
+        }
+
+        // Migration V7: catégories de paramètres gérées en base (remplacent le filtrage par mots-clés)
+        if current_version < 7 {
+            let tx = conn.transaction().map_err(db_err)?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    libelle TEXT NOT NULL UNIQUE,
+                    ordre INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .map_err(db_err)?;
+            if !Self::column_exists(&tx, "branches", "categorie_id")? {
+                tx.execute(
+                    "ALTER TABLE branches ADD COLUMN categorie_id INTEGER REFERENCES categories(id) ON DELETE SET NULL;",
+                    [],
+                )
+                .map_err(db_err)?;
+            }
+            let nb: i64 = tx.query_row("SELECT COUNT(*) FROM categories", [], |r| r.get(0)).map_err(db_err)?;
+            if nb == 0 {
+                for (i, lib) in CATEGORIES_INITIALES.iter().enumerate() {
+                    tx.execute("INSERT INTO categories (libelle, ordre) VALUES (?1, ?2)", params![lib.0, (i as i32 + 1) * 10])
+                        .map_err(db_err)?;
+                }
+            }
+            Self::apply_default_categories(&tx)?;
+            tx.execute(
+                "INSERT INTO _migrations (version, name, applied_at) VALUES (7, 'categories_parametres', ?1)",
+                params![now()],
+            )
+            .map_err(db_err)?;
+            tx.commit().map_err(db_err)?;
+        }
+
+        Ok(())
+    }
+
+    /// Classement initial des lignes sans catégorie, d'après le code ministériel (premier segment) ;
+    /// ne concerne que les catégories encore présentes sous leur libellé d'origine.
+    fn apply_default_categories(conn: &Connection) -> DbResult<()> {
+        for (libelle, condition) in CATEGORIES_INITIALES.iter() {
+            let id: Option<i64> = conn
+                .query_row("SELECT id FROM categories WHERE libelle = ?1", params![libelle], |r| r.get(0))
+                .optional()
+                .map_err(db_err)?;
+            if let Some(id) = id {
+                conn.execute(
+                    &format!(
+                        "UPDATE branches SET categorie_id = ?1 WHERE categorie_id IS NULL AND ({})",
+                        condition
+                    ),
+                    params![id],
+                )
+                .map_err(db_err)?;
+            }
+        }
         Ok(())
     }
 
@@ -517,7 +630,7 @@ impl DatabaseManager {
         let mut stmt = conn
             .prepare(
                 "SELECT id, code, branche, COALESCE(sous_code, ''), COALESCE(sous_libelle, ''), taux_apport_courtier,
-                        taux_apport_aga, taux_gestion_aga, alias_import, groupe_bordereau, ordre_bordereau
+                        taux_apport_aga, taux_gestion_aga, alias_import, groupe_bordereau, ordre_bordereau, categorie_id
                  FROM branches ORDER BY id ASC",
             )
             .map_err(db_err)?;
@@ -535,6 +648,7 @@ impl DatabaseManager {
                     alias_import: row.get(8)?,
                     groupe_bordereau: row.get(9)?,
                     ordre_bordereau: row.get(10)?,
+                    categorie_id: row.get(11)?,
                 })
             })
             .map_err(db_err)?;
@@ -573,6 +687,16 @@ impl DatabaseManager {
                 return Err(format!("Taux {} invalide ({}) : il doit être compris entre 0 % et 100 %.", nom, t));
             }
         }
+        if let Some(cid) = clean.categorie_id {
+            let conn = self.get_connection()?;
+            let existe: Option<i64> = conn
+                .query_row("SELECT id FROM categories WHERE id = ?1", params![cid], |r| r.get(0))
+                .optional()
+                .map_err(db_err)?;
+            if existe.is_none() {
+                return Err(format!("Catégorie #{} introuvable.", cid));
+            }
+        }
         let others: Vec<BrancheParam> = self
             .get_all_branches()?
             .into_iter()
@@ -608,11 +732,11 @@ impl DatabaseManager {
                 .execute(
                     "UPDATE branches SET code = ?1, branche = ?2, sous_code = ?3, sous_libelle = ?4,
                         taux_apport_courtier = ?5, taux_apport_aga = ?6, taux_gestion_aga = ?7,
-                        alias_import = ?8, groupe_bordereau = ?9, ordre_bordereau = ?10
-                     WHERE id = ?11",
+                        alias_import = ?8, groupe_bordereau = ?9, ordre_bordereau = ?10, categorie_id = ?11
+                     WHERE id = ?12",
                     params![
                         b.code, b.branche, b.sous_code, b.sous_libelle, b.taux_apport_courtier, b.taux_apport_aga,
-                        b.taux_gestion_aga, b.alias_import, b.groupe_bordereau, b.ordre_bordereau, id
+                        b.taux_gestion_aga, b.alias_import, b.groupe_bordereau, b.ordre_bordereau, b.categorie_id, id
                     ],
                 )
                 .map_err(db_err)?;
@@ -623,11 +747,11 @@ impl DatabaseManager {
         }
         conn.execute(
             "INSERT INTO branches (code, branche, sous_code, sous_libelle, taux_apport_courtier, taux_apport_aga,
-                                   taux_gestion_aga, alias_import, groupe_bordereau, ordre_bordereau)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                   taux_gestion_aga, alias_import, groupe_bordereau, ordre_bordereau, categorie_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 b.code, b.branche, b.sous_code, b.sous_libelle, b.taux_apport_courtier, b.taux_apport_aga,
-                b.taux_gestion_aga, b.alias_import, b.groupe_bordereau, b.ordre_bordereau
+                b.taux_gestion_aga, b.alias_import, b.groupe_bordereau, b.ordre_bordereau, b.categorie_id
             ],
         )
         .map_err(db_err)?;
@@ -655,6 +779,84 @@ impl DatabaseManager {
         Self::insert_default_rates(&tx)?;
         Self::fix_default_labels(&tx)?;
         Self::apply_default_mappings(&tx)?;
+        Self::apply_default_categories(&tx)?;
+        tx.commit().map_err(db_err)
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Catégories de paramètres
+    // -----------------------------------------------------------------------------------------
+
+    pub fn get_categories(&self) -> DbResult<Vec<Categorie>> {
+        let conn = self.get_connection()?;
+        let mut st = conn
+            .prepare(
+                "SELECT c.id, c.libelle, c.ordre, (SELECT COUNT(*) FROM branches b WHERE b.categorie_id = c.id)
+                 FROM categories c ORDER BY c.ordre ASC, c.libelle ASC",
+            )
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([], |r| Ok(Categorie { id: Some(r.get(0)?), libelle: r.get(1)?, ordre: r.get(2)?, nb_branches: r.get(3)? }))
+            .map_err(db_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+    }
+
+    pub fn save_categorie(&self, c: &Categorie) -> DbResult<i64> {
+        let libelle = c.libelle.trim();
+        if libelle.is_empty() {
+            return Err("Le libellé de la catégorie est obligatoire.".to_string());
+        }
+        let conn = self.get_connection()?;
+        let doublon: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM categories WHERE UPPER(libelle) = UPPER(?1) AND id IS NOT ?2",
+                params![libelle, c.id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        if doublon.is_some() {
+            return Err(format!("La catégorie « {} » existe déjà.", libelle));
+        }
+        match c.id {
+            Some(id) => {
+                let n = conn
+                    .execute("UPDATE categories SET libelle = ?1, ordre = ?2 WHERE id = ?3", params![libelle, c.ordre, id])
+                    .map_err(db_err)?;
+                if n == 0 {
+                    return Err(format!("Catégorie #{} introuvable.", id));
+                }
+                Ok(id)
+            }
+            None => {
+                conn.execute("INSERT INTO categories (libelle, ordre) VALUES (?1, ?2)", params![libelle, c.ordre])
+                    .map_err(db_err)?;
+                Ok(conn.last_insert_rowid())
+            }
+        }
+    }
+
+    /// Supprime une catégorie : ses lignes de paramètres deviennent « Sans catégorie » (taux inchangés)
+    pub fn delete_categorie(&self, id: i64) -> DbResult<()> {
+        let mut conn = self.get_connection()?;
+        let tx = conn.transaction().map_err(db_err)?;
+        tx.execute("UPDATE branches SET categorie_id = NULL WHERE categorie_id = ?1", params![id])
+            .map_err(db_err)?;
+        let n = tx.execute("DELETE FROM categories WHERE id = ?1", params![id]).map_err(db_err)?;
+        if n == 0 {
+            return Err(format!("Catégorie #{} introuvable.", id));
+        }
+        tx.commit().map_err(db_err)
+    }
+
+    /// Range plusieurs lignes de paramètres dans une catégorie (aucune = « Sans catégorie »)
+    pub fn affecter_categorie(&self, branche_ids: &[i64], categorie_id: Option<i64>) -> DbResult<()> {
+        let mut conn = self.get_connection()?;
+        let tx = conn.transaction().map_err(db_err)?;
+        for id in branche_ids {
+            tx.execute("UPDATE branches SET categorie_id = ?1 WHERE id = ?2", params![categorie_id, id])
+                .map_err(db_err)?;
+        }
         tx.commit().map_err(db_err)
     }
 
@@ -809,6 +1011,49 @@ impl DatabaseManager {
         .map_err(db_err)
     }
 
+    /// Polices déjà commissionnées dans les autres bordereaux (lignes actives, polices non exclues) :
+    /// N° de police normalisé -> numéro du bordereau
+    pub fn polices_commissionnees(&self, exclude: Option<i64>) -> DbResult<HashMap<String, String>> {
+        let conn = self.get_connection()?;
+        Self::polices_commissionnees_conn(&conn, exclude)
+    }
+
+    fn polices_commissionnees_conn(conn: &Connection, exclude: Option<i64>) -> DbResult<HashMap<String, String>> {
+        let mut st = conn
+            .prepare(
+                "SELECT b.numero_bordereau, l.contributions_json, b.facture_json FROM bordereau_lignes l
+                 JOIN bordereaux b ON b.id = l.bordereau_id
+                 WHERE b.id IS NOT ?1 AND COALESCE(l.desactive, 0) = 0 AND l.contributions_json IS NOT NULL",
+            )
+            .map_err(db_err)?;
+        let rows = st
+            .query_map(params![exclude], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+            })
+            .map_err(db_err)?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (bordereau, json, facture_json) = row.map_err(db_err)?;
+            // Libellé de l'origine : bordereau et, si saisie, facture de l'intermédiaire
+            let facture: Option<crate::models::FactureIntermediaire> = facture_json.and_then(|j| serde_json::from_str(&j).ok());
+            let numero = match facture.filter(|f| !f.numero.trim().is_empty()) {
+                Some(f) if !f.date.trim().is_empty() => format!("bordereau {} — facture N° {} du {}", bordereau, f.numero.trim(), f.date.trim()),
+                Some(f) => format!("bordereau {} — facture N° {}", bordereau, f.numero.trim()),
+                None => format!("bordereau {}", bordereau),
+            };
+            let contributions: Vec<crate::models::LigneContribution> = serde_json::from_str(&json).unwrap_or_default();
+            for c in contributions.into_iter().filter(|c| !c.exclue) {
+                if let Some(p) = c.police {
+                    let key = normaliser_police(&p);
+                    if !key.is_empty() {
+                        map.entry(key).or_insert_with(|| numero.clone());
+                    }
+                }
+            }
+        }
+        Ok(map)
+    }
+
     /// Enregistre (création ou mise à jour) un bordereau avec ses lignes et, si fournis, ses fichiers d'import.
     /// Contrôles : intermédiaire existant et cohérent, bordereau modifiable (BROUILLON), aucune ligne active
     /// non paramétrée, aucun fichier en anomalie bloquante ni déjà utilisé par un autre bordereau.
@@ -866,7 +1111,8 @@ impl DatabaseManager {
                 if let Some(a) = f.anomalies.iter().chain(f.anomalies_contexte.iter()).find(|a| a.est_bloquante()) {
                     return Err(format!("Le fichier « {} » présente une anomalie bloquante : {}", f.file_name, a.message));
                 }
-                if !f.hash.is_empty() {
+                // Rapport CIRIS : totaux sans N° de police, le contrôle se fait sur le fichier lui-même
+                if f.file_type == "CIRIS_PDF" && !f.hash.is_empty() {
                     let used: Option<String> = tx
                         .query_row(
                             "SELECT b.numero_bordereau FROM bordereau_fichiers f JOIN bordereaux b ON b.id = f.bordereau_id
@@ -884,6 +1130,28 @@ impl DatabaseManager {
                     }
                 }
             }
+        }
+
+        // Une police ne peut être commissionnée que dans un seul bordereau
+        let deja = Self::polices_commissionnees_conn(&tx, existing_id)?;
+        let mut doublons: Vec<String> = Vec::new();
+        for l in b.lignes.iter().filter(|l| !l.desactive) {
+            for c in l.contributions.iter().filter(|c| !c.exclue) {
+                if let Some(num) = c.police.as_deref().and_then(|p| deja.get(&normaliser_police(p))) {
+                    // Double facturation : une police déjà facturée ne peut pas être refacturée
+                    doublons.push(format!("{} ({})", c.police.clone().unwrap_or_default(), num));
+                }
+            }
+        }
+        if !doublons.is_empty() {
+            doublons.sort();
+            doublons.dedup();
+            return Err(format!(
+                "Double facturation refusée : {} police(s) déjà facturée(s) dans un autre bordereau : {}{}",
+                doublons.len(),
+                doublons.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+                if doublons.len() > 5 { "…" } else { "" }
+            ));
         }
 
         // Numéro de bordereau unique : suffixe -2, -3... s'il est déjà pris par un autre bordereau
@@ -909,6 +1177,7 @@ impl DatabaseManager {
         }
 
         let anomalies_json = if b.anomalies.is_empty() { None } else { serde_json::to_string(&b.anomalies).ok() };
+        let facture_json = b.facture.as_ref().and_then(|f| serde_json::to_string(f).ok());
 
         let bordereau_id: i64 = if let Some(id) = existing_id {
             tx.execute(
@@ -916,13 +1185,13 @@ impl DatabaseManager {
                     type_intermediaire = ?4, numero_bordereau = ?5, exercice = ?6, mois = ?7, code_client = ?8,
                     succursale = ?9, departement = ?10, tva_taux = ?11, date_generation = ?12, total_prime_nette = ?13,
                     total_commission_apport = ?14, total_commission_gestion = ?15, total_commission_ht = ?16,
-                    total_tva = ?17, total_commission_ttc = ?18, statut = ?19, anomalies_json = ?20
-                 WHERE id = ?21",
+                    total_tva = ?17, total_commission_ttc = ?18, statut = ?19, anomalies_json = ?20, facture_json = ?21
+                 WHERE id = ?22",
                 params![
                     inter_id, b.intermediaire_nom, b.intermediaire_code, b.type_intermediaire, numero, b.exercice, b.mois,
                     b.code_client, b.succursale, b.departement, b.tva_taux, b.date_generation, b.total_prime_nette,
                     b.total_commission_apport, b.total_commission_gestion, b.total_commission_ht, b.total_tva,
-                    b.total_commission_ttc, b.statut, anomalies_json, id
+                    b.total_commission_ttc, b.statut, anomalies_json, facture_json, id
                 ],
             )
             .map_err(db_err)?;
@@ -934,13 +1203,13 @@ impl DatabaseManager {
                  (intermediaire_id, intermediaire_nom, intermediaire_code, type_intermediaire, numero_bordereau,
                   exercice, mois, code_client, succursale, departement, tva_taux, date_generation,
                   total_prime_nette, total_commission_apport, total_commission_gestion, total_commission_ht,
-                  total_tva, total_commission_ttc, statut, anomalies_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                  total_tva, total_commission_ttc, statut, anomalies_json, facture_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 params![
                     inter_id, b.intermediaire_nom, b.intermediaire_code, b.type_intermediaire, numero, b.exercice, b.mois,
                     b.code_client, b.succursale, b.departement, b.tva_taux, b.date_generation, b.total_prime_nette,
                     b.total_commission_apport, b.total_commission_gestion, b.total_commission_ht, b.total_tva,
-                    b.total_commission_ttc, b.statut, anomalies_json
+                    b.total_commission_ttc, b.statut, anomalies_json, facture_json
                 ],
             )
             .map_err(db_err)?;
@@ -993,24 +1262,29 @@ impl DatabaseManager {
                     (_, Some(fid)) => {
                         tx.execute(
                             "UPDATE bordereau_fichiers SET nom_fichier = ?1, client_code = ?2, client_nom = ?3, periode = ?4,
-                                total_prime_nette = ?5, nb_lignes = ?6, anomalies_json = ?7 WHERE id = ?8",
+                                total_prime_nette = ?5, nb_lignes = ?6, anomalies_json = ?7, selection = ?8 WHERE id = ?9",
                             params![
                                 f.file_name, f.code, f.courtier_ou_client, f.periode, f.total_prime_nette,
-                                f.items.len() as i64, anomalies_json, fid
+                                f.items.len() as i64, anomalies_json, f.selection, fid
                             ],
                         )
                         .map_err(db_err)?;
                     }
                     (Some(contenu), None) => {
                         tx.execute(
+                            "INSERT OR IGNORE INTO fichiers_contenu (hash, contenu) VALUES (?1, ?2)",
+                            params![f.hash, contenu],
+                        )
+                        .map_err(db_err)?;
+                        tx.execute(
                             "INSERT INTO bordereau_fichiers
                              (bordereau_id, type_piece, nom_fichier, type_fichier, hash, taille, date_ajout, client_code,
-                              client_nom, periode, total_prime_nette, nb_lignes, anomalies_json, contenu)
+                              client_nom, periode, total_prime_nette, nb_lignes, anomalies_json, selection)
                              VALUES (?1, 'IMPORT', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                             params![
                                 bordereau_id, f.file_name, f.file_type, f.hash, contenu.len() as i64, date, f.code,
                                 f.courtier_ou_client, f.periode, f.total_prime_nette, f.items.len() as i64, anomalies_json,
-                                contenu
+                                f.selection
                             ],
                         )
                         .map_err(db_err)?;
@@ -1039,6 +1313,7 @@ impl DatabaseManager {
                     tx.execute("DELETE FROM bordereau_fichiers WHERE id = ?1", params![fid]).map_err(db_err)?;
                 }
             }
+            Self::purger_contenus_orphelins(&tx)?;
         }
 
         tx.commit().map_err(db_err)?;
@@ -1071,13 +1346,14 @@ impl DatabaseManager {
             lignes: Vec::new(),
             anomalies: anomalies_json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(),
             fichiers: Vec::new(),
+            facture: row.get::<_, Option<String>>(21)?.and_then(|j| serde_json::from_str(&j).ok()),
         })
     }
 
     const BORDEREAU_COLS: &'static str = "id, intermediaire_id, intermediaire_nom, intermediaire_code, type_intermediaire,
         numero_bordereau, exercice, mois, code_client, succursale, departement, tva_taux, date_generation,
         total_prime_nette, total_commission_apport, total_commission_gestion, total_commission_ht, total_tva,
-        total_commission_ttc, statut, anomalies_json";
+        total_commission_ttc, statut, anomalies_json, facture_json";
 
     pub fn get_all_bordereaux(&self) -> DbResult<Vec<Bordereau>> {
         let conn = self.get_connection()?;
@@ -1149,6 +1425,29 @@ impl DatabaseManager {
         Ok(Some(b))
     }
 
+    /// Enregistre la facture de l'intermédiaire (confirmation). Possible en brouillon ou validé, pas une fois réglé :
+    /// elle ne modifie ni les taux ni les montants calculés du bordereau.
+    pub fn enregistrer_facture(&self, id: i64, facture: Option<&crate::models::FactureIntermediaire>) -> DbResult<()> {
+        let conn = self.get_connection()?;
+        let statut: String = conn
+            .query_row("SELECT statut FROM bordereaux WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()
+            .map_err(db_err)?
+            .ok_or_else(|| format!("Bordereau #{} introuvable.", id))?;
+        if statut == "REGLE" {
+            return Err("Bordereau réglé : la facture ne peut plus être modifiée.".to_string());
+        }
+        if let Some(f) = facture {
+            if let Some((k, v)) = f.montants_ht.iter().find(|(_, v)| !v.is_finite()) {
+                return Err(format!("Montant invalide pour « {} » : {}", k, v));
+            }
+        }
+        let json = facture.and_then(|f| serde_json::to_string(f).ok());
+        conn.execute("UPDATE bordereaux SET facture_json = ?1 WHERE id = ?2", params![json, id])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     pub fn update_bordereau_statut(&self, id: i64, statut: &str) -> DbResult<()> {
         if !STATUTS_BORDEREAU.contains(&statut) {
             return Err(format!("Statut invalide : {}", statut));
@@ -1183,6 +1482,16 @@ impl DatabaseManager {
         }
         // Lignes et fichiers supprimés en cascade
         conn.execute("DELETE FROM bordereaux WHERE id = ?1", params![id]).map_err(db_err)?;
+        Self::purger_contenus_orphelins(&conn)
+    }
+
+    /// Supprime les contenus de fichiers qui ne sont plus rattachés à aucun bordereau
+    fn purger_contenus_orphelins(conn: &Connection) -> DbResult<()> {
+        conn.execute(
+            "DELETE FROM fichiers_contenu WHERE hash NOT IN (SELECT hash FROM bordereau_fichiers)",
+            [],
+        )
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -1195,7 +1504,7 @@ impl DatabaseManager {
         let mut st = conn
             .prepare(
                 "SELECT id, bordereau_id, type_piece, nom_fichier, type_fichier, hash, taille, date_ajout, client_code,
-                        client_nom, periode, total_prime_nette, nb_lignes, anomalies_json
+                        client_nom, periode, total_prime_nette, nb_lignes, anomalies_json, selection
                  FROM bordereau_fichiers WHERE bordereau_id = ?1 ORDER BY type_piece ASC, id ASC",
             )
             .map_err(db_err)?;
@@ -1217,6 +1526,7 @@ impl DatabaseManager {
                     total_prime_nette: r.get(11)?,
                     nb_lignes: r.get(12)?,
                     anomalies: an.and_then(|j| serde_json::from_str::<Vec<Anomalie>>(&j).ok()).unwrap_or_default(),
+                    selection: r.get(14)?,
                 })
             })
             .map_err(db_err)?;
@@ -1240,17 +1550,18 @@ impl DatabaseManager {
             return Err(format!("Bordereau #{} introuvable.", bordereau_id));
         }
         let ext = Path::new(nom).extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
+        conn.execute("INSERT OR IGNORE INTO fichiers_contenu (hash, contenu) VALUES (?1, ?2)", params![hash, contenu])
+            .map_err(db_err)?;
         conn.execute(
-            "INSERT INTO bordereau_fichiers (bordereau_id, type_piece, nom_fichier, type_fichier, hash, taille, date_ajout, contenu)
-             VALUES (?1, 'PIECE_JOINTE', ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO bordereau_fichiers (bordereau_id, type_piece, nom_fichier, type_fichier, hash, taille, date_ajout)
+             VALUES (?1, 'PIECE_JOINTE', ?2, ?3, ?4, ?5, ?6)",
             params![
                 bordereau_id,
                 nom,
                 if ext.is_empty() { "FICHIER".to_string() } else { ext },
                 hash,
                 contenu.len() as i64,
-                Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                contenu
+                Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
             ],
         )
         .map_err(db_err)?;
@@ -1260,7 +1571,8 @@ impl DatabaseManager {
     pub fn get_fichier_contenu(&self, fichier_id: i64) -> DbResult<(String, i64, Vec<u8>)> {
         let conn = self.get_connection()?;
         conn.query_row(
-            "SELECT nom_fichier, bordereau_id, contenu FROM bordereau_fichiers WHERE id = ?1",
+            "SELECT f.nom_fichier, f.bordereau_id, c.contenu FROM bordereau_fichiers f
+             JOIN fichiers_contenu c ON c.hash = f.hash WHERE f.id = ?1",
             params![fichier_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -1282,6 +1594,11 @@ impl DatabaseManager {
             );
         }
         conn.execute("DELETE FROM bordereau_fichiers WHERE id = ?1", params![fichier_id]).map_err(db_err)?;
-        Ok(())
+        Self::purger_contenus_orphelins(&conn)
     }
+}
+
+/// N° de police comparable d'un fichier à l'autre (sans espaces, en majuscules)
+pub fn normaliser_police(p: &str) -> String {
+    p.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase()
 }

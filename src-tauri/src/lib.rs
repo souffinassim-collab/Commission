@@ -3,6 +3,7 @@ pub mod db;
 pub mod calculation;
 pub mod parser;
 pub mod export;
+pub mod detail;
 pub mod commands;
 
 use db::DatabaseManager;
@@ -24,11 +25,17 @@ pub fn run() {
             save_branche,
             delete_branche,
             reset_branches_to_default,
+            get_categories,
+            save_categorie,
+            delete_categorie,
+            affecter_categorie,
             get_intermediaires,
             save_intermediaire,
             delete_intermediaire,
-            scan_excel_clients,
-            scan_excel_clients_base64,
+            analyser_classeur,
+            analyser_classeur_base64,
+            clients_point_vente,
+            importer_classeur,
             parse_file_auto,
             parse_file_auto_base64,
             clear_pending_files,
@@ -44,6 +51,9 @@ pub fn run() {
             delete_piece_jointe,
             ouvrir_fichier,
             export_excel,
+            detail_production,
+            export_detail_production,
+            enregistrer_facture_intermediaire,
         ])
         .run(tauri::generate_context!())
         .expect("Erreur lors de l'exécution de l'application Tauri");
@@ -122,6 +132,7 @@ mod tests {
     fn req_for(inter: &Intermediaire, files: Vec<UploadedFileResult>, exercice: i32, mois: Option<i32>) -> CalculateMultiBordereauRequest {
         CalculateMultiBordereauRequest {
             files,
+            bordereau_id: None,
             intermediaire_id: inter.id,
             type_intermediaire: inter.type_intermediaire.clone(),
             intermediaire_code: inter.code.clone(),
@@ -141,7 +152,7 @@ mod tests {
         let db = test_db();
         let branches = db.get_all_branches().unwrap();
         assert!(branches.len() >= 70);
-        assert_eq!(db.get_info().unwrap().version, 4);
+        assert_eq!(db.get_info().unwrap().version, 7);
         let vrc = branches.iter().find(|b| b.sous_code == "VRC").unwrap();
         assert_eq!(vrc.alias_import, "VP,VO,VR");
         assert_eq!(vrc.groupe_bordereau, "RC AUTOMOBILE");
@@ -157,7 +168,15 @@ mod tests {
     /// Migration de la base réelle (copie) : les bordereaux existants sont relus sans changement de taux
     #[test]
     fn test_migration_base_existante_sans_modification() {
-        let src = std::path::Path::new("../BDD/commissions.db");
+        for base in ["../BDD/commissions.db", "../exe/BDD/commissions.db"] {
+            verifier_migration_base_reelle(base);
+        }
+    }
+
+    /// Applique toutes les migrations sur une COPIE de la base indiquée et vérifie que les bordereaux
+    /// existants sont relus à l'identique (taux, montants) et rattachés à leur intermédiaire.
+    fn verifier_migration_base_reelle(chemin: &str) {
+        let src = std::path::Path::new(chemin);
         if !src.exists() {
             return;
         }
@@ -171,7 +190,11 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         drop(st);
-        let dir = std::env::temp_dir().join(format!("commissions_migration_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "commissions_migration_{}_{}",
+            std::process::id(),
+            chemin.replace(['.', '/', '\\'], "_")
+        ));
         std::fs::create_dir_all(dir.join("BDD")).unwrap();
         let target = dir.join("BDD").join("commissions.db");
         let _ = std::fs::remove_file(&target);
@@ -181,7 +204,7 @@ mod tests {
         drop(before);
 
         let db = DatabaseManager::with_path(&target).expect("migration");
-        assert_eq!(db.get_info().unwrap().version, 4);
+        assert_eq!(db.get_info().unwrap().version, 7);
         for b in db.get_all_bordereaux().unwrap() {
             let full = db.get_bordereau_by_id(b.id.unwrap()).unwrap().unwrap();
             assert!(full.intermediaire_id.is_some(), "bordereau {} rattaché à son intermédiaire", full.numero_bordereau);
@@ -200,9 +223,9 @@ mod tests {
     fn test_exclusion_polices_non_encaissees() {
         let db = test_db();
         let Ok(xls) = std::fs::read("../Import/Divers.xlsx") else { return };
-        let excel = ExcelProductionParser::parse_from_bytes(&xls, "Divers.xlsx", Some("SPA FSP")).unwrap();
+        let excel = ExcelProductionParser::parse_from_bytes(&xls, "Divers.xlsx", &crate::parser::ExcelSelection { point_vente: Some("347".into()), clients: vec!["347024203/0".into()] }, None).unwrap();
         let courtier = new_courtier(&db, "CRT-347");
-        let mut b = CalculationEngine::compute_multi_bordereau(&req_for(&courtier, vec![excel], 2025, None), &db.get_all_branches().unwrap());
+        let mut b = CalculationEngine::compute_multi_bordereau(&req_for(&courtier, vec![excel], 2025, None), &db.get_all_branches().unwrap(), &std::collections::HashMap::new());
         let ht_avant = b.total_commission_ht;
         let idx = b.lignes.iter().position(|l| l.libelle_garantie == "AUTOMOBILE FACULTATIF").unwrap();
         let prime_avant = b.lignes[idx].prime_nette;
@@ -239,6 +262,306 @@ mod tests {
         assert!(!all.lignes[j].est_active());
     }
 
+    /// Une police déjà commissionnée dans un bordereau enregistré n'est pas recomptée (signalée),
+    /// et l'enregistrement d'un doublon est refusé. Un même registre sert à plusieurs bordereaux.
+    #[test]
+    fn test_police_deja_commissionnee_non_recomptee() {
+        use parser::{ExcelSelection, PeriodeBordereau};
+        let db = test_db();
+        let Some(bytes) = parser::tests::fichier_test("PROD2026.XLS") else { return };
+        let aga = inter_by_code(&db, "492");
+        let periode = Some(PeriodeBordereau { exercice: 2026, mois: Some(5) });
+        let sel = ExcelSelection { point_vente: Some("492".into()), clients: vec![] };
+        let mut f = ExcelProductionParser::parse_from_bytes(&bytes, "PROD2026.XLS", &sel, periode).unwrap();
+        f.hash = "prod2026".to_string();
+        let branches = db.get_all_branches().unwrap();
+
+        let mut b = CalculationEngine::compute_multi_bordereau(&req_for(&aga, vec![f.clone()], 2026, Some(5)), &branches, &db.polices_commissionnees(None).unwrap());
+        // Codes branche sans alias (ex: RD, RN) : lignes non paramétrées, exclues ici pour le test
+        for l in b.lignes.iter_mut().filter(|l| l.non_parametre) {
+            l.desactive = true;
+        }
+        CalculationEngine::recompute_bordereau(&mut b);
+        assert!(b.total_prime_nette > 0.0);
+        let imports = [ImportAEnregistrer { fichier: &f, contenu: Some(bytes.clone()) }];
+        let id = db.save_bordereau(&b, Some(&imports)).unwrap();
+
+        // Même registre pour un autre point de vente : autorisé (plus de blocage sur l'empreinte du fichier)
+        let autre = inter_by_code(&db, "445");
+        let sel445 = ExcelSelection { point_vente: Some("445".into()), clients: vec![] };
+        let mut f445 = ExcelProductionParser::parse_from_bytes(&bytes, "PROD2026.XLS", &sel445, periode).unwrap();
+        f445.hash = "prod2026".to_string();
+        let mut b445 = CalculationEngine::compute_multi_bordereau(&req_for(&autre, vec![f445.clone()], 2026, Some(5)), &branches, &db.polices_commissionnees(None).unwrap());
+        for l in b445.lignes.iter_mut().filter(|l| l.non_parametre) {
+            l.desactive = true;
+        }
+        CalculationEngine::recompute_bordereau(&mut b445);
+        // Contenu identique (même empreinte) : stocké une seule fois en base
+        let imports445 = [ImportAEnregistrer { fichier: &f445, contenu: Some(bytes.clone()) }];
+        let id445 = db.save_bordereau(&b445, Some(&imports445)).unwrap();
+        assert_ne!(id, id445);
+        let c1 = db.list_fichiers(id).unwrap()[0].id.unwrap();
+        let c2 = db.list_fichiers(id445).unwrap()[0].id.unwrap();
+        assert_eq!(db.get_fichier_contenu(c1).unwrap().2.len(), db.get_fichier_contenu(c2).unwrap().2.len());
+
+        // Facture saisie sur le premier bordereau : elle est citée comme origine de la double facturation
+        db.enregistrer_facture(id, Some(&models::FactureIntermediaire { numero: "F-492-05".into(), date: "10/06/2026".into(), ..Default::default() }))
+            .unwrap();
+        // Réimport du point de vente 492 pour mai : toutes les polices sont déjà facturées
+        let deja = db.polices_commissionnees(None).unwrap();
+        let mut again = CalculationEngine::compute_multi_bordereau(&req_for(&aga, vec![f.clone()], 2026, Some(5)), &branches, &deja);
+        assert_eq!(again.total_prime_nette, 0.0);
+        assert!(again
+            .anomalies
+            .iter()
+            .any(|a| a.message.contains("Double facturation") && a.message.contains(&b.numero_bordereau) && a.message.contains("F-492-05")));
+        // Les polices restent visibles, verrouillées (déjà facturées) et exclues du calcul
+        let contribs: Vec<&models::LigneContribution> = again.lignes.iter().flat_map(|l| l.contributions.iter()).collect();
+        assert!(!contribs.is_empty());
+        assert!(contribs.iter().all(|c| c.exclue && c.deja_facturee.as_deref().unwrap_or("").contains("F-492-05")));
+        assert!(again.lignes.iter().all(|l| !l.est_active()));
+        // Tentative de refacturation (réintégration forcée) : refusée par la base
+        for l in again.lignes.iter_mut() {
+            for c in l.contributions.iter_mut() {
+                c.exclue = false;
+            }
+        }
+        CalculationEngine::recompute_bordereau(&mut again);
+        assert!(again.total_prime_nette > 0.0);
+        for l in again.lignes.iter_mut().filter(|l| l.non_parametre) {
+            l.desactive = true;
+        }
+        assert!(db.save_bordereau(&again, None).unwrap_err().contains("Double facturation refusée"));
+        let mut doublon = b.clone();
+        doublon.id = None;
+        assert!(db.save_bordereau(&doublon, None).unwrap_err().contains("Double facturation refusée"));
+        // Le bordereau lui-même peut être ré-enregistré (ses propres polices ne sont pas des doublons)
+        assert_eq!(db.save_bordereau(&db.get_bordereau_by_id(id).unwrap().unwrap(), None).unwrap(), id);
+
+        // Suppression : le contenu partagé reste tant qu'un bordereau l'utilise
+        db.delete_bordereau(id).unwrap();
+        assert_eq!(db.get_fichier_contenu(c2).unwrap().2.len(), bytes.len());
+    }
+
+    /// Reproduit le modèle « Détail a confirmé.xlsx » (docs/) : courtier 715 CAPASSURANCE, exercice 2026,
+    /// TVA 9 %, police VF ventilée (RC / assistance / dommages) et facture du courtier saisie.
+    #[test]
+    fn test_detail_production_modele_service_commercial() {
+        use models::{BordereauLigne, FactureIntermediaire, LigneContribution};
+        let db = test_db();
+        let mut courtier = new_courtier(&db, "715");
+        courtier.nom = "CAPASSURANCE".to_string();
+        courtier.tva_applicable = 0.09;
+        db.save_intermediaire(&courtier).unwrap();
+        let courtier = db.get_intermediaire(courtier.id.unwrap()).unwrap().unwrap();
+
+        let contrib_g = |police: &str, branche: &str, garantie: Option<&str>, montant: f64, cp: f64, ttc: f64| LigneContribution {
+            fichier_source: "Registre.xls".to_string(),
+            police: Some(police.to_string()),
+            client: Some("OPGI TAMANRASSET".to_string()),
+            montant,
+            exclue: false,
+            client_code: Some("350021468/0".to_string()),
+            branche: Some(branche.to_string()),
+            date_emission: Some("30/12/2025".to_string()),
+            date_effet: Some("01/01/2026".to_string()),
+            date_echeance: Some("31/12/2026".to_string()),
+            cp: Some(cp),
+            prime_ttc: Some(ttc),
+            deja_facturee: None,
+            garantie: garantie.map(|g| g.to_string()),
+        };
+        let contrib = |police: &str, branche: &str, montant: f64, cp: f64, ttc: f64| contrib_g(police, branche, None, montant, cp, ttc);
+
+        let ligne = |libelle: &str, taux: f64, contributions: Vec<LigneContribution>| BordereauLigne {
+            id: None,
+            bordereau_id: None,
+            branche_id: None,
+            code_garantie: libelle.to_string(),
+            libelle_garantie: libelle.to_string(),
+            branche_nom: libelle.to_string(),
+            prime_nette: 0.0,
+            taux_apport: taux,
+            taux_gestion: 0.0,
+            montant_apport: 0.0,
+            montant_gestion: 0.0,
+            montant_ht: 0.0,
+            montant_tva: 0.0,
+            montant_ttc: 0.0,
+            non_parametre: false,
+            desactive: false,
+            contributions,
+            source_code: None,
+            source_code_ministeriel: None,
+            source_type: None,
+        };
+        let vf = "350/VF/349/0/0";
+        let mut b = models::Bordereau {
+            id: None,
+            intermediaire_id: courtier.id,
+            intermediaire_nom: courtier.nom.clone(),
+            intermediaire_code: courtier.code.clone(),
+            type_intermediaire: "COURTIER".to_string(),
+            numero_bordereau: "BORD-COURTIER-715-2026".to_string(),
+            exercice: 2026,
+            mois: None,
+            code_client: Some("350021468/0".to_string()),
+            succursale: "Succursale Sud".to_string(),
+            departement: "Département commercial".to_string(),
+            tva_taux: 0.09,
+            date_generation: "2026-10-25".to_string(),
+            total_prime_nette: 0.0,
+            total_commission_apport: 0.0,
+            total_commission_gestion: 0.0,
+            total_commission_ht: 0.0,
+            total_tva: 0.0,
+            total_commission_ttc: 0.0,
+            statut: "BROUILLON".to_string(),
+            lignes: vec![
+                ligne("RC AUTO", 0.05, vec![contrib_g(vf, "VF", Some("VRC"), 8493.14, 300.0, 192638.23)]),
+                ligne("GARANTIES FACULT", 0.10, vec![contrib_g(vf, "VF", Some("VTR"), 133015.38, 300.0, 192638.23)]),
+                ligne("ASSISTANSE", 0.075, vec![contrib_g(vf, "VF", Some("VASS"), 15000.0, 300.0, 192638.23)]),
+                ligne(
+                    "INCENDIE",
+                    0.08,
+                    vec![contrib("350/IM/5/0/0", "IM", 1805528.28, 500.0, 2149893.65), contrib("350/IN/27/0/0", "IN", 43824.51, 500.0, 53466.17)],
+                ),
+                ligne(
+                    "CAT-NAT",
+                    0.05,
+                    vec![
+                        contrib("350/CN/3909/0/0", "CN", 107163.67, 150.0, 107353.67),
+                        contrib("350/CN/3910/0/0", "CN", 4092.74, 150.0, 4282.74),
+                        contrib("350/CN/3911/0/0", "CN", 3308.31, 150.0, 3498.31),
+                        contrib("350/CN/3912/0/0", "CN", 7002.19, 150.0, 7192.19),
+                        contrib("350/CN/3913/0/0", "CN", 2886.58, 150.0, 3076.58),
+                        contrib("350/CN/3914/0/0", "CN", 27957.02, 150.0, 28147.02),
+                    ],
+                ),
+                ligne("RC G", 0.08, vec![contrib("350/RG/27/0/0", "RG", 80000.0, 500.0, 96035.0)]),
+                ligne("VOL", 0.10, vec![contrib("350/VM/17/0/0", "VM", 17620.0, 500.0, 21762.8)]),
+                ligne("T-Informatique", 0.08, vec![contrib("350/TI/23/0/0", "TI", 15165.0, 500.0, 18961.35)]),
+            ],
+            anomalies: vec![],
+            fichiers: vec![],
+            facture: None,
+        };
+        CalculationEngine::recompute_bordereau(&mut b);
+
+        // Commission calculée par branche (colonne COM-HT du modèle)
+        let ht: Vec<f64> = b.lignes.iter().map(|l| l.montant_ht).collect();
+        assert_eq!(ht, vec![424.66, 13301.54, 1125.0, 147948.22, 7620.53, 6400.0, 1762.0, 1213.2]);
+
+        // Facture du courtier (colonne VOTR-COM-HT du modèle)
+        let declare = [424.66, 13301.54, 1125.0, 147948.22, 7620.53, 6400.0, 1762.0, 1213.2];
+        let mut facture = FactureIntermediaire { numero: "F-2026-12".into(), date: "15/10/2026".into(), ..Default::default() };
+        for (l, v) in b.lignes.iter().zip(declare.iter()) {
+            facture.montants_ht.insert(detail::cle_ligne(l), *v);
+        }
+        b.facture = Some(facture.clone());
+        let d = detail::construire(&b);
+        assert_eq!(d.polices.len(), 12);
+        assert_eq!(d.total_prime_nette, 2271056.82);
+        assert_eq!(d.total_prime_lignes, 2271056.82);
+        assert_eq!(d.controle, 0.0);
+        // La police VF est ventilée sur RC / facultatif / assistance, CP et TTC repris une seule fois
+        // Colonnes de l'état : VRC | VRCV | ASSISTANSE | Dommages (= reste de la prime nette)
+        assert_eq!(d.titre, "Détail de production courtier");
+        assert_eq!(d.colonnes_ventilation, vec!["VRC", "VRCV", "ASSISTANSE", "Dommages"]);
+        let pvf = d.polices.iter().find(|p| p.police == vf).unwrap();
+        assert_eq!(pvf.prime_nette, 156508.52);
+        assert_eq!(pvf.ventilation, vec![Some(8493.14), None, Some(15000.0), Some(133015.38)]);
+        assert_eq!(d.total_ventilation, vec![8493.14, 0.0, 15000.0, 133015.38]);
+        // Polices non auto : pas de ventilation
+        assert!(d.polices.iter().filter(|p| p.police != vf).all(|p| p.ventilation.iter().all(|v| v.is_none())));
+        assert_eq!(pvf.prime_ttc, Some(192638.23));
+        assert_eq!(d.total_cp, 3700.0);
+        assert_eq!(d.clients, vec!["OPGI TAMANRASSET 350021468/0".to_string()]);
+        assert_eq!(d.ht_calcule, 179795.15);
+        assert_eq!(d.ht_declare, 179795.15);
+        assert_eq!(d.ecart_ht, 0.0);
+        assert_eq!(d.tva_calculee, 16181.56);
+        assert_eq!(d.ttc_calcule, 195976.71);
+        assert_eq!(d.ecart_ttc, 0.0);
+        assert_eq!(d.lignes_non_saisies, 0);
+
+        // Écart : le courtier déclare 100 DA de plus sur l'incendie
+        let mut f2 = facture.clone();
+        *f2.montants_ht.get_mut(&detail::cle_ligne(&b.lignes[3])).unwrap() += 100.0;
+        let mut b2 = b.clone();
+        b2.facture = Some(f2);
+        let d2 = detail::construire(&b2);
+        assert_eq!(d2.lignes[3].ecart, Some(100.0));
+        assert_eq!(d2.ecart_ht, 100.0);
+        assert_eq!(d2.ecart_tva, 9.0);
+        assert_eq!(d2.ecart_ttc, 109.0);
+
+        // Enregistrement, saisie de la facture, relecture, export Excel du modèle
+        let id = db.save_bordereau(&b, None).unwrap();
+        db.enregistrer_facture(id, b2.facture.as_ref()).unwrap();
+        let relu = db.get_bordereau_by_id(id).unwrap().unwrap();
+        assert_eq!(relu.facture.as_ref().unwrap().numero, "F-2026-12");
+        let dr = detail::construire(&relu);
+        assert_eq!(dr.ecart_ht, 100.0);
+        assert_eq!(dr.polices.len(), 12);
+        let xlsx = std::env::temp_dir().join(format!("detail_production_{}.xlsx", std::process::id()));
+        ExcelExporter::export_detail_production(&dr, &xlsx).unwrap();
+        if let Ok(copie) = std::env::var("COPIE_ETAT_DETAIL") {
+            ExcelExporter::export_detail_production(&detail::construire(&b), &copie).unwrap();
+        }
+        assert!(xlsx.exists());
+        let _ = std::fs::remove_file(xlsx);
+        // Facture verrouillée une fois le bordereau réglé
+        db.update_bordereau_statut(id, "VALIDE").unwrap();
+        db.enregistrer_facture(id, b2.facture.as_ref()).unwrap();
+        db.update_bordereau_statut(id, "REGLE").unwrap();
+        assert!(db.enregistrer_facture(id, None).is_err());
+    }
+
+    #[test]
+    fn test_crud_categories_parametres() {
+        let db = test_db();
+        let cats = db.get_categories().unwrap();
+        let noms: Vec<&str> = cats.iter().map(|c| c.libelle.as_str()).collect();
+        assert_eq!(noms, vec!["Automobile", "Transport & Maritime", "Agricole", "Incendie & Risques Divers", "Responsabilité Civile"]);
+        let branches = db.get_all_branches().unwrap();
+        let cat = |libelle: &str| cats.iter().find(|c| c.libelle == libelle).unwrap().id;
+        // Classement par code ministériel : les garanties auto (bris de glace, vol…) restent en Automobile
+        for sc in ["VBDG", "VINV", "VOLV", "VVA", "VRC"] {
+            assert_eq!(branches.iter().find(|b| b.sous_code == sc).unwrap().categorie_id, cat("Automobile"), "{}", sc);
+        }
+        assert_eq!(branches.iter().find(|b| b.code == "8.1.1.0").unwrap().categorie_id, cat("Incendie & Risques Divers"));
+        assert_eq!(branches.iter().find(|b| b.code == "13.1").unwrap().categorie_id, cat("Responsabilité Civile"));
+        assert!(branches.iter().filter(|b| b.branche.to_lowercase().contains("agricole")).all(|b| b.categorie_id == cat("Agricole")));
+
+        // Create / Update / doublon
+        let id = db.save_categorie(&models::Categorie { id: None, libelle: "Engineering".into(), ordre: 60, nb_branches: 0 }).unwrap();
+        assert!(db.save_categorie(&models::Categorie { id: None, libelle: "engineering".into(), ordre: 0, nb_branches: 0 }).is_err());
+        assert!(db.save_categorie(&models::Categorie { id: None, libelle: " ".into(), ordre: 0, nb_branches: 0 }).is_err());
+        db.save_categorie(&models::Categorie { id: Some(id), libelle: "Engineering & Chantiers".into(), ordre: 60, nb_branches: 0 }).unwrap();
+        // Affectation de lignes
+        let ec: Vec<i64> = branches.iter().filter(|b| b.code.starts_with("9.5") || b.code.starts_with("9.4")).map(|b| b.id.unwrap()).collect();
+        db.affecter_categorie(&ec, Some(id)).unwrap();
+        let c = db.get_categories().unwrap().into_iter().find(|c| c.id == Some(id)).unwrap();
+        assert_eq!(c.libelle, "Engineering & Chantiers");
+        assert_eq!(c.nb_branches, ec.len() as i64);
+        // Ligne de paramètre : catégorie inexistante refusée
+        let mut b = branches[0].clone();
+        b.categorie_id = Some(9999);
+        assert!(db.save_branche(&b).is_err());
+        // Delete : les lignes deviennent « sans catégorie », taux inchangés
+        let avant = db.get_all_branches().unwrap();
+        db.delete_categorie(id).unwrap();
+        let apres = db.get_all_branches().unwrap();
+        for i in &ec {
+            let a = avant.iter().find(|b| b.id == Some(*i)).unwrap();
+            let p = apres.iter().find(|b| b.id == Some(*i)).unwrap();
+            assert_eq!(p.categorie_id, None);
+            assert_eq!(p.taux_apport_courtier, a.taux_apport_courtier);
+        }
+        assert!(db.delete_categorie(id).is_err());
+    }
+
     #[test]
     fn test_crud_parametres() {
         let db = test_db();
@@ -255,6 +578,7 @@ mod tests {
             alias_import: " xx , yy ".to_string(),
             groupe_bordereau: "GROUPE TEST".to_string(),
             ordre_bordereau: 5,
+            categorie_id: None,
         };
         // Create
         let id = db.save_branche(&b).unwrap();
@@ -332,7 +656,7 @@ mod tests {
         let db = test_db();
         let Some((file, _)) = ciris_file(&db) else { return };
         let aga = inter_by_code(&db, "492");
-        let b = CalculationEngine::compute_multi_bordereau(&req_for(&aga, vec![file], 2025, Some(5)), &db.get_all_branches().unwrap());
+        let b = CalculationEngine::compute_multi_bordereau(&req_for(&aga, vec![file], 2025, Some(5)), &db.get_all_branches().unwrap(), &std::collections::HashMap::new());
         for l in &b.lignes {
             println!("{} | {} | {:.2} | {} | {} | {:.2}", l.code_garantie, l.branche_nom, l.prime_nette, l.taux_apport, l.taux_gestion, l.montant_apport);
         }
@@ -357,7 +681,7 @@ mod tests {
         let Some((file, bytes)) = ciris_file(&db) else { return };
         let aga = inter_by_code(&db, "492");
         let branches = db.get_all_branches().unwrap();
-        let mut computed = CalculationEngine::compute_multi_bordereau(&req_for(&aga, vec![file.clone()], 2025, Some(5)), &branches);
+        let mut computed = CalculationEngine::compute_multi_bordereau(&req_for(&aga, vec![file.clone()], 2025, Some(5)), &branches, &std::collections::HashMap::new());
 
         // Désactivation d'une ligne : exclue des totaux
         computed.lignes[0].desactive = true;
@@ -455,7 +779,7 @@ mod tests {
         db.delete_branche(vass.id.unwrap()).unwrap();
         file.anomalies.clear();
         let aga = inter_by_code(&db, "492");
-        let mut b = CalculationEngine::compute_multi_bordereau(&req_for(&aga, vec![file], 2025, Some(5)), &db.get_all_branches().unwrap());
+        let mut b = CalculationEngine::compute_multi_bordereau(&req_for(&aga, vec![file], 2025, Some(5)), &db.get_all_branches().unwrap(), &std::collections::HashMap::new());
         let np = b.lignes.iter().position(|l| l.non_parametre).expect("ligne non paramétrée");
         assert_eq!(b.lignes[np].taux_apport, 0.0);
         assert_eq!(b.lignes[np].source_code.as_deref(), Some("VASS"));
@@ -474,7 +798,7 @@ mod tests {
         let db = test_db();
         let Some((file, _)) = ciris_file(&db) else { return };
         let aga = inter_by_code(&db, "492");
-        let mut b = CalculationEngine::compute_multi_bordereau(&req_for(&aga, vec![file], 2025, Some(5)), &db.get_all_branches().unwrap());
+        let mut b = CalculationEngine::compute_multi_bordereau(&req_for(&aga, vec![file], 2025, Some(5)), &db.get_all_branches().unwrap(), &std::collections::HashMap::new());
         let mut sans = b.clone();
         sans.intermediaire_id = None;
         assert!(db.save_bordereau(&sans, None).is_err());
@@ -490,25 +814,25 @@ mod tests {
         let (Ok(pdf), Ok(xls)) = (std::fs::read("../Import/RCCDVF.pdf"), std::fs::read("../Import/Divers.xlsx")) else { return };
         let flotte = FlottePdfParser::parse_from_bytes(&pdf, "RCCDVF.pdf", &known).unwrap();
         assert_eq!(flotte.total_prime_nette, 764317.19);
-        let excel = ExcelProductionParser::parse_from_bytes(&xls, "Divers.xlsx", Some("SPA FSP")).unwrap();
+        let excel = ExcelProductionParser::parse_from_bytes(&xls, "Divers.xlsx", &crate::parser::ExcelSelection { point_vente: Some("347".into()), clients: vec!["347024203/0".into()] }, None).unwrap();
         assert_eq!(excel.items.len(), 10);
         let courtier = new_courtier(&db, "CRT-347");
         let branches = db.get_all_branches().unwrap();
 
         // Police 347/VF/304/0/0 présente dans les deux fichiers : comptée une seule fois (PDF importé en premier),
         // signalée sans bloquer l'enregistrement
-        let b = CalculationEngine::compute_multi_bordereau(&req_for(&courtier, vec![flotte.clone(), excel.clone()], 2025, None), &branches);
+        let b = CalculationEngine::compute_multi_bordereau(&req_for(&courtier, vec![flotte.clone(), excel.clone()], 2025, None), &branches, &std::collections::HashMap::new());
         assert_eq!(b.total_prime_nette, CalculationEngine::round_cents(flotte.total_prime_nette + excel.total_prime_nette - 764317.19));
         assert!(b.anomalies_bloquantes().is_empty(), "{:?}", b.anomalies);
         let avert: Vec<_> = b.anomalies.iter().filter(|a| a.message.contains("présente dans deux fichiers")).collect();
         assert_eq!(avert.len(), 1, "{:?}", b.anomalies);
         assert!(avert[0].message.contains("347/VF/304/0/0") && avert[0].message.contains("RCCDVF.pdf"));
         // Ordre inverse : c'est la ligne Excel qui est retenue, le total est identique
-        let inv = CalculationEngine::compute_multi_bordereau(&req_for(&courtier, vec![excel.clone(), flotte.clone()], 2025, None), &branches);
+        let inv = CalculationEngine::compute_multi_bordereau(&req_for(&courtier, vec![excel.clone(), flotte.clone()], 2025, None), &branches, &std::collections::HashMap::new());
         assert_eq!(inv.total_prime_nette, b.total_prime_nette);
 
         // Excel seul : chaque code branche prend le taux du paramètre auquel il est rattaché (alias d'import)
-        let e = CalculationEngine::compute_multi_bordereau(&req_for(&courtier, vec![excel], 2025, None), &branches);
+        let e = CalculationEngine::compute_multi_bordereau(&req_for(&courtier, vec![excel], 2025, None), &branches, &std::collections::HashMap::new());
         assert!(e.anomalies_bloquantes().is_empty(), "{:?}", e.anomalies);
         let get = |label: &str| e.lignes.iter().find(|l| l.libelle_garantie == label).unwrap_or_else(|| panic!("{}", label));
         assert_eq!(get("RC AUTOMOBILE").prime_nette, 1593.59);
@@ -523,7 +847,7 @@ mod tests {
         // PDF de flotte seul, sans cumul : une ligne par garantie avec le barème courtier
         let mut req = req_for(&courtier, vec![flotte], 2025, None);
         req.cumuler_par_branche = false;
-        let detail = CalculationEngine::compute_multi_bordereau(&req, &branches);
+        let detail = CalculationEngine::compute_multi_bordereau(&req, &branches, &std::collections::HashMap::new());
         assert!(detail.lignes.iter().any(|l| l.code_garantie == "VRC"));
         assert_eq!(detail.total_prime_nette, 764317.19);
         assert!(detail.anomalies_bloquantes().is_empty());
