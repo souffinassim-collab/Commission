@@ -426,9 +426,23 @@ impl CalculationEngine {
             anomalies,
             fichiers: Vec::new(),
             facture: None,
+            client_libelle: None,
         };
+        bordereau.client_libelle = Self::libelle_clients_lignes(&bordereau.lignes);
         Self::recompute_bordereau(&mut bordereau);
         bordereau
+    }
+
+    /// Client(s) des polices comptées dans le bordereau, au format « code nom »
+    pub fn libelle_clients_lignes(lignes: &[BordereauLigne]) -> Option<String> {
+        crate::models::libelle_clients(
+            lignes
+                .iter()
+                .filter(|l| !l.desactive)
+                .flat_map(|l| l.contributions.iter())
+                .filter(|c| !c.exclue)
+                .map(|c| (c.client_code.as_deref(), c.client.as_deref())),
+        )
     }
 
     /// Recalcule les montants de chaque ligne à partir de SES PROPRES taux (figés dans la ligne,

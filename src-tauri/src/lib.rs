@@ -152,7 +152,7 @@ mod tests {
         let db = test_db();
         let branches = db.get_all_branches().unwrap();
         assert!(branches.len() >= 70);
-        assert_eq!(db.get_info().unwrap().version, 7);
+        assert_eq!(db.get_info().unwrap().version, 8);
         let vrc = branches.iter().find(|b| b.sous_code == "VRC").unwrap();
         assert_eq!(vrc.alias_import, "VP,VO,VR");
         assert_eq!(vrc.groupe_bordereau, "RC AUTOMOBILE");
@@ -204,7 +204,7 @@ mod tests {
         drop(before);
 
         let db = DatabaseManager::with_path(&target).expect("migration");
-        assert_eq!(db.get_info().unwrap().version, 7);
+        assert_eq!(db.get_info().unwrap().version, 8);
         for b in db.get_all_bordereaux().unwrap() {
             let full = db.get_bordereau_by_id(b.id.unwrap()).unwrap().unwrap();
             assert!(full.intermediaire_id.is_some(), "bordereau {} rattaché à son intermédiaire", full.numero_bordereau);
@@ -445,6 +445,7 @@ mod tests {
             anomalies: vec![],
             fichiers: vec![],
             facture: None,
+            client_libelle: None,
         };
         CalculationEngine::recompute_bordereau(&mut b);
 
@@ -498,8 +499,12 @@ mod tests {
 
         // Enregistrement, saisie de la facture, relecture, export Excel du modèle
         let id = db.save_bordereau(&b, None).unwrap();
+        let mut mauvaise = b2.facture.clone().unwrap();
+        mauvaise.date = "2026-10-15".into();
+        assert!(db.enregistrer_facture(id, Some(&mauvaise)).unwrap_err().contains("JJ/MM/AAAA"));
         db.enregistrer_facture(id, b2.facture.as_ref()).unwrap();
         let relu = db.get_bordereau_by_id(id).unwrap().unwrap();
+        assert_eq!(relu.client_libelle.as_deref(), Some("350021468/0 OPGI TAMANRASSET"));
         assert_eq!(relu.facture.as_ref().unwrap().numero, "F-2026-12");
         let dr = detail::construire(&relu);
         assert_eq!(dr.ecart_ht, 100.0);
@@ -560,6 +565,28 @@ mod tests {
             assert_eq!(p.taux_apport_courtier, a.taux_apport_courtier);
         }
         assert!(db.delete_categorie(id).is_err());
+    }
+
+    #[test]
+    fn test_libelle_client_et_dates() {
+        use models::{date_valide, libelle_clients};
+        assert_eq!(
+            libelle_clients([(Some("350021468/0"), Some("OPGI TAMANRASSET")), (Some("350021468/0"), Some("OPGI TAMANRASSET"))].into_iter()),
+            Some("350021468/0 OPGI TAMANRASSET".to_string())
+        );
+        assert_eq!(
+            libelle_clients([(Some("A/0"), Some("X")), (Some("B/0"), Some("Y"))].into_iter()),
+            Some("A/0 X & B/0 Y".to_string())
+        );
+        let beaucoup: Vec<(String, String)> = (0..7).map(|i| (format!("C{}", i), format!("N{}", i))).collect();
+        assert_eq!(libelle_clients(beaucoup.iter().map(|(c, n)| (Some(c.as_str()), Some(n.as_str())))), Some("7 clients".to_string()));
+        assert_eq!(libelle_clients(std::iter::empty()), None);
+        for ok in ["", "01/01/2026", "29/02/2024", "31/12/2026"] {
+            assert!(date_valide(ok), "{}", ok);
+        }
+        for ko in ["2026-01-01", "1/1/2026", "31/02/2026", "29/02/2026", "32/01/2026", "01/13/2026", "01/01/26"] {
+            assert!(!date_valide(ko), "{}", ko);
+        }
     }
 
     #[test]

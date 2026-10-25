@@ -215,6 +215,33 @@ pub struct Bordereau {
     /// Facture de l'intermédiaire saisie pour confirmation
     #[serde(default)]
     pub facture: Option<FactureIntermediaire>,
+    /// Client(s) du bordereau au format « code nom » (plusieurs : séparés par « & »)
+    #[serde(default)]
+    pub client_libelle: Option<String>,
+}
+
+/// Libellé client « code nom » à partir des couples (code, nom) ; au-delà de 5 clients : « N clients »
+pub fn libelle_clients<'a>(couples: impl Iterator<Item = (Option<&'a str>, Option<&'a str>)>) -> Option<String> {
+    let mut vus: Vec<String> = Vec::new();
+    for (code, nom) in couples {
+        let code = code.map(str::trim).unwrap_or("");
+        let nom = nom.map(str::trim).unwrap_or("");
+        let lib = format!("{} {}", code, nom).trim().to_string();
+        if !lib.is_empty() && !vus.contains(&lib) {
+            vus.push(lib);
+        }
+    }
+    match vus.len() {
+        0 => None,
+        1..=5 => Some(vus.join(" & ")),
+        n => Some(format!("{} clients", n)),
+    }
+}
+
+/// Date au format JJ/MM/AAAA, vérifiée (jour existant) ; vide accepté
+pub fn date_valide(s: &str) -> bool {
+    let s = s.trim();
+    s.is_empty() || (s.len() == 10 && chrono::NaiveDate::parse_from_str(s, "%d/%m/%Y").is_ok())
 }
 
 impl BordereauLigne {

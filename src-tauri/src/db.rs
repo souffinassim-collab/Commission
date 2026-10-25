@@ -21,7 +21,7 @@ pub struct DatabaseManager {
 }
 
 /// Dernière version de schéma connue (à incrémenter à chaque nouvelle migration)
-const LATEST_SCHEMA_VERSION: i32 = 7;
+const LATEST_SCHEMA_VERSION: i32 = 8;
 
 pub const STATUTS_BORDEREAU: [&str; 3] = ["BROUILLON", "VALIDE", "REGLE"];
 
@@ -390,6 +390,20 @@ impl DatabaseManager {
             Self::apply_default_categories(&tx)?;
             tx.execute(
                 "INSERT INTO _migrations (version, name, applied_at) VALUES (7, 'categories_parametres', ?1)",
+                params![now()],
+            )
+            .map_err(db_err)?;
+            tx.commit().map_err(db_err)?;
+        }
+
+        // Migration V8: client(s) du bordereau au format « code nom »
+        if current_version < 8 {
+            let tx = conn.transaction().map_err(db_err)?;
+            if !Self::column_exists(&tx, "bordereaux", "client_libelle")? {
+                tx.execute("ALTER TABLE bordereaux ADD COLUMN client_libelle TEXT;", []).map_err(db_err)?;
+            }
+            tx.execute(
+                "INSERT INTO _migrations (version, name, applied_at) VALUES (8, 'client_libelle_bordereau', ?1)",
                 params![now()],
             )
             .map_err(db_err)?;
@@ -1178,6 +1192,16 @@ impl DatabaseManager {
 
         let anomalies_json = if b.anomalies.is_empty() { None } else { serde_json::to_string(&b.anomalies).ok() };
         let facture_json = b.facture.as_ref().and_then(|f| serde_json::to_string(f).ok());
+        if let Some(f) = &b.facture {
+            if !crate::models::date_valide(&f.date) {
+                return Err(format!("Date de facture invalide « {} » : format attendu JJ/MM/AAAA.", f.date));
+            }
+        }
+        let client_libelle = b
+            .client_libelle
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| crate::calculation::CalculationEngine::libelle_clients_lignes(&b.lignes));
 
         let bordereau_id: i64 = if let Some(id) = existing_id {
             tx.execute(
@@ -1185,13 +1209,14 @@ impl DatabaseManager {
                     type_intermediaire = ?4, numero_bordereau = ?5, exercice = ?6, mois = ?7, code_client = ?8,
                     succursale = ?9, departement = ?10, tva_taux = ?11, date_generation = ?12, total_prime_nette = ?13,
                     total_commission_apport = ?14, total_commission_gestion = ?15, total_commission_ht = ?16,
-                    total_tva = ?17, total_commission_ttc = ?18, statut = ?19, anomalies_json = ?20, facture_json = ?21
+                    total_tva = ?17, total_commission_ttc = ?18, statut = ?19, anomalies_json = ?20, facture_json = ?21,
+                    client_libelle = ?23
                  WHERE id = ?22",
                 params![
                     inter_id, b.intermediaire_nom, b.intermediaire_code, b.type_intermediaire, numero, b.exercice, b.mois,
                     b.code_client, b.succursale, b.departement, b.tva_taux, b.date_generation, b.total_prime_nette,
                     b.total_commission_apport, b.total_commission_gestion, b.total_commission_ht, b.total_tva,
-                    b.total_commission_ttc, b.statut, anomalies_json, facture_json, id
+                    b.total_commission_ttc, b.statut, anomalies_json, facture_json, id, client_libelle
                 ],
             )
             .map_err(db_err)?;
@@ -1203,13 +1228,13 @@ impl DatabaseManager {
                  (intermediaire_id, intermediaire_nom, intermediaire_code, type_intermediaire, numero_bordereau,
                   exercice, mois, code_client, succursale, departement, tva_taux, date_generation,
                   total_prime_nette, total_commission_apport, total_commission_gestion, total_commission_ht,
-                  total_tva, total_commission_ttc, statut, anomalies_json, facture_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                  total_tva, total_commission_ttc, statut, anomalies_json, facture_json, client_libelle)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
                 params![
                     inter_id, b.intermediaire_nom, b.intermediaire_code, b.type_intermediaire, numero, b.exercice, b.mois,
                     b.code_client, b.succursale, b.departement, b.tva_taux, b.date_generation, b.total_prime_nette,
                     b.total_commission_apport, b.total_commission_gestion, b.total_commission_ht, b.total_tva,
-                    b.total_commission_ttc, b.statut, anomalies_json, facture_json
+                    b.total_commission_ttc, b.statut, anomalies_json, facture_json, client_libelle
                 ],
             )
             .map_err(db_err)?;
@@ -1347,13 +1372,14 @@ impl DatabaseManager {
             anomalies: anomalies_json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(),
             fichiers: Vec::new(),
             facture: row.get::<_, Option<String>>(21)?.and_then(|j| serde_json::from_str(&j).ok()),
+            client_libelle: row.get(22)?,
         })
     }
 
     const BORDEREAU_COLS: &'static str = "id, intermediaire_id, intermediaire_nom, intermediaire_code, type_intermediaire,
         numero_bordereau, exercice, mois, code_client, succursale, departement, tva_taux, date_generation,
         total_prime_nette, total_commission_apport, total_commission_gestion, total_commission_ht, total_tva,
-        total_commission_ttc, statut, anomalies_json, facture_json";
+        total_commission_ttc, statut, anomalies_json, facture_json, client_libelle";
 
     pub fn get_all_bordereaux(&self) -> DbResult<Vec<Bordereau>> {
         let conn = self.get_connection()?;
@@ -1422,6 +1448,9 @@ impl DatabaseManager {
         drop(l_stmt);
         drop(conn);
         b.fichiers = self.list_fichiers(id)?;
+        if b.client_libelle.as_deref().map_or(true, |s| s.trim().is_empty()) {
+            b.client_libelle = crate::calculation::CalculationEngine::libelle_clients_lignes(&b.lignes);
+        }
         Ok(Some(b))
     }
 
@@ -1438,6 +1467,9 @@ impl DatabaseManager {
             return Err("Bordereau réglé : la facture ne peut plus être modifiée.".to_string());
         }
         if let Some(f) = facture {
+            if !crate::models::date_valide(&f.date) {
+                return Err(format!("Date de facture invalide « {} » : format attendu JJ/MM/AAAA.", f.date));
+            }
             if let Some((k, v)) = f.montants_ht.iter().find(|(_, v)| !v.is_finite()) {
                 return Err(format!("Montant invalide pour « {} » : {}", k, v));
             }

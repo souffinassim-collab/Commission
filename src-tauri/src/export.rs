@@ -78,7 +78,8 @@ impl ExcelExporter {
             worksheet.write_string(3, 0, format!("COURTIER : {}", bordereau.intermediaire_nom))?;
             worksheet.write_string(4, 0, format!("Code : {}", bordereau.intermediaire_code))?;
             worksheet.write_string(5, 0, format!("N° FACTURE : {}", bordereau.numero_bordereau))?;
-            worksheet.write_string(6, 0, format!("CODE CLIENT : {}", bordereau.code_client.as_deref().unwrap_or("N/A")))?;
+            let client = bordereau.client_libelle.clone().or_else(|| bordereau.code_client.clone()).unwrap_or_else(|| "N/A".to_string());
+            worksheet.write_string(6, 0, format!("CLIENT : {}", client))?;
             worksheet.write_string(7, 0, format!("EXERCICE : {}", bordereau.exercice))?;
         } else {
             worksheet.write_string(3, 0, format!("AGA : {}", bordereau.intermediaire_nom))?;
