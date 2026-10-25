@@ -1,5 +1,43 @@
-# Logs
-logs
+# ==========================================
+# Build & Executables (.exe, builds, caches)
+# ==========================================
+exe/
+*.exe
+target/
+src-tauri/target/
+src-tauri/gen/schemas/
+dist/
+dist-ssr/
+
+# ==========================================
+# Dependencies
+# ==========================================
+node_modules/
+
+# ==========================================
+# Databases & Backups (SQLite)
+# ==========================================
+BDD/backups/
+BDD/*.db
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ==========================================
+# Generated exports & Office temp files
+# ==========================================
+*.tmp
+~$*.xlsx
+~$*.xls
+~$*.doc*
+src-tauri/Bordereau_*.xlsx
+
+# ==========================================
+# Logs & debug files
+# ==========================================
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -7,26 +45,31 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
+# ==========================================
+# OS & Environment files
+# ==========================================
+.DS_Store
+Thumbs.db
+desktop.ini
 *.local
+.env
+.env.*
+!.env.example
 
-# Editor directories and files
+# ==========================================
+# Editor & IDE directories
+# ==========================================
 .vscode/*
 !.vscode/extensions.json
-.idea
-.DS_Store
+.idea/
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
 
-# SQLite databases & backups
-BDD/backups/
-*.db-wal
-*.db-shm
-
-# graft's local graph cache — regenerable, not committed (run `graft build`).
+# ==========================================
+# Tool & AI caches
+# ==========================================
 /graft/
+.agents/
