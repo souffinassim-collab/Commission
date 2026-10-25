@@ -137,7 +137,7 @@ pub fn construire(b: &Bordereau) -> DetailProduction {
 
     // Clients : un même nom avec plusieurs codes s'écrit « NOM code1 & code2 »
     let mut clients_codes: Vec<(String, Vec<String>)> = Vec::new();
-    let mut details = Vec::new();
+    let mut details: Vec<PoliceDetail> = Vec::new();
     let mut total_vent = vec![0.0; 4];
     let (mut total_pn, mut total_cp, mut total_ttc) = (0.0, 0.0, 0.0);
     for (police, a) in &polices {
@@ -187,6 +187,13 @@ pub fn construire(b: &Bordereau) -> DetailProduction {
             prime_ttc: a.ttc,
         });
     }
+
+    // Ordre de l'état : polices simples par N° de police, puis polices automobile ventilées (RC / assistance / dommages)
+    details.sort_by(|a, b| {
+        let va = a.ventilation.iter().any(|v| v.is_some());
+        let vb = b.ventilation.iter().any(|v| v.is_some());
+        va.cmp(&vb).then_with(|| a.police.cmp(&b.police))
+    });
 
     let clients: Vec<String> = clients_codes
         .into_iter()

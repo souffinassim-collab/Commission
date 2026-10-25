@@ -102,6 +102,8 @@ export interface LigneRapprochement {
 
 /** « Détail de production » à confirmer : détail par police, rapprochement calcul / facture, écarts */
 export interface DetailProduction {
+  /** « Détail de production courtier » (ou AGA) */
+  titre: string;
   succursale: string;
   departement: string;
   type_intermediaire: string;

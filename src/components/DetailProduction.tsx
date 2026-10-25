@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { Save, Printer, FileSpreadsheet, Copy, AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { Bordereau, DetailProduction, FactureIntermediaire } from '../types';
 import { api, errMsg, formatMontant } from '../lib/api';
+import logoCaat from '../assets/logo_caat.png';
 
 interface Props {
   bordereau: Bordereau;
@@ -20,6 +21,9 @@ const lireMontant = (s: string): number | undefined => {
 };
 
 const fmt = (v?: number | null) => (v === undefined || v === null ? '' : formatMontant(v));
+/** Format comptable de l'état : vide si absent, « - » pour zéro */
+const fmtZ = (v?: number | null) =>
+  v === undefined || v === null ? '' : Math.abs(v) < 0.005 ? '-' : formatMontant(v);
 const pct = (t: number) => `${(Math.round(t * 10000) / 100).toLocaleString('fr-DZ')}%`;
 
 /**
@@ -105,9 +109,9 @@ export const DetailProductionView: React.FC<Props> = ({ bordereau, modifiable, o
   const role = d.type_intermediaire === 'COURTIER' ? 'Courtier' : 'AGA';
   const ecartCls = (v?: number | null) =>
     v === undefined || v === null ? 'text-slate-300' : Math.abs(v) < 0.005 ? 'text-emerald-700' : 'text-rose-700 font-bold';
-  const td = 'border border-slate-300 px-1.5 py-1';
-  const tdNum = `${td} text-right font-mono whitespace-nowrap`;
-  const th = 'border border-slate-300 px-1.5 py-1 bg-slate-100 font-bold text-left';
+  const td = 'border border-slate-400 px-1.5 py-0.5';
+  const tdNum = `${td} text-right whitespace-nowrap`;
+  const th = 'border border-slate-400 px-1.5 py-1 font-normal text-center';
   const ecartsNonNuls = d.lignes.filter((l) => l.ecart !== undefined && l.ecart !== null && Math.abs(l.ecart) >= 0.005).length;
 
   return (
@@ -186,39 +190,38 @@ export const DetailProductionView: React.FC<Props> = ({ bordereau, modifiable, o
         </div>
       </div>
 
-      {/* Document « Détail de production » (présentation du modèle) */}
-      <div className="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm print:shadow-none print:border-none print:p-0 max-w-6xl mx-auto text-[11px] text-slate-900">
-        <div className="font-bold">{d.succursale}</div>
-        <div className="font-bold">{d.departement}</div>
-        <div className="text-center font-black text-base my-2">Détail de production</div>
-        <div className="grid grid-cols-[110px_1fr] gap-x-2 gap-y-0.5 font-bold mb-3">
+      {/* État « Détail de production courtier » — présentation du modèle (A4 paysage) */}
+      <div
+        className="etat-detail bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm print:shadow-none print:border-none print:rounded-none print:p-0 max-w-6xl mx-auto text-[11px] text-black"
+        style={{ fontFamily: 'Calibri, Carlito, "Segoe UI", Arial, sans-serif' }}
+      >
+        <div className="flex items-start justify-between">
+          <div className="font-bold text-[15px] leading-6" style={{ fontFamily: '"Times New Roman", Times, serif' }}>
+            <div>{d.succursale}</div>
+            <div>{d.departement}</div>
+          </div>
+          <img src={logoCaat} alt="CAAT" className="h-16 w-auto" />
+        </div>
+        <div className="text-center font-bold text-[24px] -mt-4 mb-4">{d.titre}</div>
+
+        <div className="grid grid-cols-[90px_1fr] gap-x-2 font-bold text-[12px] mb-1">
           <span>Client :</span>
           <span>{d.clients.join(' & ') || '—'}</span>
-          <span>{role} :</span>
+          <span>{d.type_intermediaire === 'COURTIER' ? 'Courtier :' : 'AGA :'}</span>
           <span>{d.intermediaire}</span>
           <span>EXERCICE</span>
           <span>
             {d.exercice}
             {d.mois ? ` (mois ${String(d.mois).padStart(2, '0')})` : ''}
           </span>
-          <span className="font-normal">Bordereau :</span>
-          <span className="font-normal">{d.numero_bordereau}</span>
-          {(facture.numero || facture.date) && (
-            <>
-              <span className="font-normal">Facture :</span>
-              <span className="font-normal">
-                N° {facture.numero} {facture.date && `du ${facture.date}`}
-              </span>
-            </>
-          )}
         </div>
 
         {/* Détail par police */}
-        <table className="w-full border-collapse mb-5">
+        <table className="w-full border-collapse mb-6">
           <thead>
             <tr>
               {['Exercice', 'Police', 'Branche', "Date d'émission", "Date d'éffet", "Date d'échéance", 'Prime Nette', ...d.colonnes_ventilation, 'CP', 'Prime ttc'].map((h) => (
-                <th key={h} className={th}>
+                <th key={h} className={th} style={{ backgroundColor: '#DCE6F1' }}>
                   {h}
                 </th>
               ))}
@@ -227,44 +230,43 @@ export const DetailProductionView: React.FC<Props> = ({ bordereau, modifiable, o
           <tbody>
             {d.polices.map((p) => (
               <tr key={p.police}>
-                <td className={td}>{p.exercice}</td>
-                <td className={`${td} font-mono`}>{p.police}</td>
-                <td className={td}>{p.branche}</td>
-                <td className={`${td} text-center`}>{p.date_emission}</td>
-                <td className={`${td} text-center`}>{p.date_effet}</td>
-                <td className={`${td} text-center`}>{p.date_echeance}</td>
-                <td className={tdNum}>{fmt(p.prime_nette)}</td>
+                <td className={`${td} text-center`}>{p.exercice}</td>
+                <td className={td}>{p.police}</td>
+                <td className={`${td} text-center`}>{p.branche}</td>
+                <td className={`${td} text-right`}>{p.date_emission}</td>
+                <td className={`${td} text-right`}>{p.date_effet}</td>
+                <td className={`${td} text-right`}>{p.date_echeance}</td>
+                <td className={tdNum}>{fmtZ(p.prime_nette)}</td>
                 {p.ventilation.map((v, i) => (
                   <td key={i} className={tdNum}>
-                    {fmt(v)}
+                    {fmtZ(v)}
                   </td>
                 ))}
-                <td className={tdNum}>{fmt(p.cp)}</td>
-                <td className={tdNum}>{fmt(p.prime_ttc)}</td>
+                <td className={tdNum}>{fmtZ(p.cp)}</td>
+                <td className={tdNum}>{fmtZ(p.prime_ttc)}</td>
               </tr>
             ))}
-            <tr className="font-bold bg-slate-100">
-              <td className={td} colSpan={6}>
-                TOTAL
-              </td>
-              <td className={tdNum}>{fmt(d.total_prime_nette)}</td>
+            <tr>
+              <td colSpan={5} />
+              <td className={`${td} text-center font-bold`}>TOTAL</td>
+              <td className={tdNum}>{fmtZ(d.total_prime_nette)}</td>
               {d.total_ventilation.map((v, i) => (
                 <td key={i} className={tdNum}>
-                  {fmt(v)}
+                  {fmtZ(v)}
                 </td>
               ))}
-              <td className={tdNum}>{fmt(d.total_cp)}</td>
-              <td className={tdNum}>{fmt(d.total_prime_ttc)}</td>
+              <td className={tdNum}>{fmtZ(d.total_cp)}</td>
+              <td className={tdNum}>{fmtZ(d.total_prime_ttc)}</td>
             </tr>
           </tbody>
         </table>
 
-        {/* Rapprochement commission calculée / facture */}
-        <table className="border-collapse mb-4 min-w-[640px]">
+        {/* Rapprochement commission calculée / facture du courtier */}
+        <table className="border-collapse mb-6 ml-[7%] min-w-[640px]">
           <thead>
             <tr>
-              {['Branche', 'P-NET', 'TAUX', 'COM-HT', 'VOTRE-COM-HT', 'Ecart'].map((h) => (
-                <th key={h} className={th}>
+              {['Branche', 'P-NET', 'TAUX', 'COM-HT', 'VOTR-COM-HT', 'Ecart'].map((h) => (
+                <th key={h} className={`${th} text-center`} style={{ backgroundColor: '#DCE6F1' }}>
                   {h}
                 </th>
               ))}
@@ -274,9 +276,9 @@ export const DetailProductionView: React.FC<Props> = ({ bordereau, modifiable, o
             {d.lignes.map((l) => (
               <tr key={l.cle}>
                 <td className={td}>{l.libelle}</td>
-                <td className={tdNum}>{fmt(l.prime_nette)}</td>
+                <td className={tdNum}>{fmtZ(l.prime_nette)}</td>
                 <td className={`${td} text-right`}>{pct(l.taux)}</td>
-                <td className={tdNum}>{fmt(l.com_ht_calculee)}</td>
+                <td className={tdNum}>{fmtZ(l.com_ht_calculee)}</td>
                 <td className={`${tdNum} p-0`}>
                   <input
                     value={saisies[l.cle] ?? ''}
@@ -284,53 +286,58 @@ export const DetailProductionView: React.FC<Props> = ({ bordereau, modifiable, o
                     onChange={(e) => modifier(() => setSaisies((s) => ({ ...s, [l.cle]: e.target.value })))}
                     inputMode="decimal"
                     placeholder="à saisir"
-                    className="w-32 text-right font-mono px-1.5 py-1 bg-amber-50/60 focus:bg-white outline-none print:hidden"
+                    className="w-32 text-right font-mono px-1.5 py-1 bg-amber-50/70 focus:bg-white outline-none print:hidden"
                   />
-                  <span className="hidden print:inline px-1.5">{fmt(l.com_ht_declaree)}</span>
+                  <span className="hidden print:inline px-1.5">{fmtZ(l.com_ht_declaree)}</span>
                 </td>
-                <td className={`${tdNum} ${ecartCls(l.ecart)}`}>{fmt(l.ecart)}</td>
+                <td className={`${tdNum} ${ecartCls(l.ecart)}`}>{fmtZ(l.ecart)}</td>
               </tr>
             ))}
-            <tr className="font-bold">
+            <tr>
               <td className={td}>TOTAL</td>
-              <td className={tdNum}>{fmt(d.total_prime_lignes)}</td>
-              <td className={td} colSpan={4} />
+              <td className={tdNum}>{fmtZ(d.total_prime_lignes)}</td>
+              <td className={td} />
+              <td className={td} />
+              <td className={td} />
+              <td className={tdNum}>-</td>
             </tr>
             <tr>
-              <td className={td}>Contrôle (branches − détail)</td>
-              <td className={`${tdNum} ${ecartCls(d.controle)}`}>{fmt(d.controle)}</td>
+              <td />
+              <td className={`px-1.5 py-1 text-right font-mono ${ecartCls(d.controle)}`} title="Contrôle : total des branches − total du détail">
+                {fmtZ(d.controle)}
+              </td>
               <td className={`${td} font-bold`}>TOTAL HT</td>
-              <td className={`${tdNum} font-bold`}>{fmt(d.ht_calcule)}</td>
-              <td className={`${tdNum} font-bold`}>{fmt(d.ht_declare)}</td>
-              <td className={`${tdNum} ${ecartCls(d.ecart_ht)}`}>{fmt(d.ecart_ht)}</td>
+              <td className={`${tdNum} font-bold`}>{fmtZ(d.ht_calcule)}</td>
+              <td className={`${tdNum} font-bold`}>{fmtZ(d.ht_declare)}</td>
+              <td className={`${tdNum} font-bold ${ecartCls(d.ecart_ht)}`}>{fmtZ(d.ecart_ht)}</td>
             </tr>
             <tr>
-              <td className={td} colSpan={2} />
+              <td colSpan={2} />
               <td className={`${td} font-bold`}>TVA {pct(d.tva_taux)}</td>
-              <td className={`${tdNum} font-bold`}>{fmt(d.tva_calculee)}</td>
-              <td className={`${tdNum} font-bold`}>{fmt(d.tva_declaree)}</td>
-              <td className={`${tdNum} ${ecartCls(d.ecart_tva)}`}>{fmt(d.ecart_tva)}</td>
+              <td className={`${tdNum} font-bold`}>{fmtZ(d.tva_calculee)}</td>
+              <td className={`${tdNum} font-bold`}>{fmtZ(d.tva_declaree)}</td>
+              <td className={`${tdNum} font-bold ${ecartCls(d.ecart_tva)}`}>{fmtZ(d.ecart_tva)}</td>
             </tr>
             <tr>
-              <td className={td} colSpan={2} />
+              <td colSpan={2} />
               <td className={`${td} font-bold`}>TOTAL T.T.C</td>
-              <td className={`${tdNum} font-bold`}>{fmt(d.ttc_calcule)}</td>
-              <td className={`${tdNum} font-bold`}>{fmt(d.ttc_declare)}</td>
-              <td className={`${tdNum} ${ecartCls(d.ecart_ttc)}`}>{fmt(d.ecart_ttc)}</td>
+              <td className={`${tdNum} font-bold`}>{fmtZ(d.ttc_calcule)}</td>
+              <td className={`${tdNum} font-bold`}>{fmtZ(d.ttc_declare)}</td>
+              <td className={`${tdNum} font-bold ${ecartCls(d.ecart_ttc)}`}>{fmtZ(d.ecart_ttc)}</td>
             </tr>
           </tbody>
         </table>
 
         {d.polices_exclues.length > 0 && (
-          <p className="mb-3 text-slate-600">
-            Polices exclues (non encaissées) : {d.polices_exclues.length} —{' '}
-            {fmt(d.polices_exclues.reduce((s, p) => s + p[2], 0))} DZD non commissionnés ({d.polices_exclues.map((p) => p[0]).join(', ')}).
+          <p className="mb-2 text-[10px] text-slate-600">
+            Polices exclues (non encaissées) : {d.polices_exclues.length} — {fmt(d.polices_exclues.reduce((s, p) => s + p[2], 0))} DZD non
+            commissionnés ({d.polices_exclues.map((p) => p[0]).join(', ')}).
           </p>
         )}
-        {facture.commentaire && <p className="mb-3">Observation : {facture.commentaire}</p>}
+        {facture.commentaire && <p className="mb-2 text-[10px]">Observation : {facture.commentaire}</p>}
 
-        <div className="text-center font-bold mt-8">Vérification et Confirmation d'encaissement par le directeur d'Agence</div>
-        <div className="h-20" />
+        <div className="text-center font-bold text-[12px] mt-6">Vérification et Confirmation d'encaissement par le directeur d'Agence</div>
+        <div className="h-16" />
       </div>
     </div>
   );
