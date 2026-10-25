@@ -1090,7 +1090,12 @@ export const ParametresPage: React.FC = () => {
                 <input
                   value={nouvelleCategorie}
                   onChange={(e) => setNouvelleCategorie(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && ajouterCategorie()}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      ajouterCategorie();
+                    }
+                  }}
                   placeholder="Nouvelle catégorie…"
                   className="flex-1 px-3 py-2 border border-slate-200 rounded-lg"
                 />

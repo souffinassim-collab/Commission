@@ -1197,11 +1197,9 @@ impl DatabaseManager {
                 return Err(format!("Date de facture invalide « {} » : format attendu JJ/MM/AAAA.", f.date));
             }
         }
-        let client_libelle = b
-            .client_libelle
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| crate::calculation::CalculationEngine::libelle_clients_lignes(&b.lignes));
+        // Client(s) recalculé(s) à partir des polices réellement comptées (exclusions comprises)
+        let client_libelle = crate::calculation::CalculationEngine::libelle_clients_lignes(&b.lignes)
+            .or_else(|| b.client_libelle.clone().filter(|s| !s.trim().is_empty()));
 
         let bordereau_id: i64 = if let Some(id) = existing_id {
             tx.execute(

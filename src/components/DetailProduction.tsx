@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { Save, Printer, FileSpreadsheet, Copy, AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { Bordereau, DetailProduction, FactureIntermediaire } from '../types';
 import { api, errMsg, formatMontant } from '../lib/api';
+import { DateInput } from './Shared';
 import logoCaat from '../assets/logo_caat.png';
 
 interface Props {
@@ -41,6 +42,7 @@ export const DetailProductionView: React.FC<Props> = ({ bordereau, modifiable, o
   const [detail, setDetail] = useState<DetailProduction | null>(null);
   const [enregistre, setEnregistre] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [dateOk, setDateOk] = useState(true);
 
   const facture: FactureIntermediaire = useMemo(() => {
     const montants_ht: Record<string, number> = {};
@@ -138,7 +140,8 @@ export const DetailProductionView: React.FC<Props> = ({ bordereau, modifiable, o
               <button
                 type="button"
                 onClick={enregistrer}
-                disabled={saving || enregistre}
+                disabled={saving || enregistre || !dateOk}
+                title={dateOk ? '' : 'Date de facture invalide (JJ/MM/AAAA)'}
                 className="px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white font-bold flex items-center gap-1.5 cursor-pointer"
               >
                 <Save className="w-3.5 h-3.5" /> {saving ? 'Enregistrement…' : 'Enregistrer la facture'}
@@ -159,7 +162,13 @@ export const DetailProductionView: React.FC<Props> = ({ bordereau, modifiable, o
           </label>
           <label className="block">
             <span className="font-semibold text-slate-600">Date de facture</span>
-            <input value={date} disabled={!modifiable} placeholder="JJ/MM/AAAA" onChange={(e) => modifier(() => setDate(e.target.value))} className="w-full border border-slate-200 rounded-lg p-2 mt-1" />
+            <DateInput
+              value={date}
+              disabled={!modifiable}
+              onChange={(v) => modifier(() => setDate(v))}
+              onValidite={setDateOk}
+              className="w-full border border-slate-200 rounded-lg p-2 mt-1"
+            />
           </label>
           <label className="block md:col-span-2">
             <span className="font-semibold text-slate-600">Observation</span>

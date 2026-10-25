@@ -205,6 +205,8 @@ export interface Bordereau {
   fichiers?: FichierBordereau[];
   /** Facture de l'intermédiaire saisie pour confirmation */
   facture?: FactureIntermediaire;
+  /** Client(s) du bordereau au format « code nom » */
+  client_libelle?: string;
 }
 
 export interface ExtractedItem {

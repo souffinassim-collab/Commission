@@ -1,6 +1,7 @@
 import React from 'react';
 import { AlertTriangle, AlertCircle, Info, X, Search, CheckCircle2, Ban } from 'lucide-react';
 import { Anomalie, BordereauLigne, StatutBordereau } from '../types';
+import { erreurDate, masquerDate, aujourdhui } from '../lib/dates';
 
 const round2 = (v: number) => Math.round(v * 100) / 100;
 
@@ -67,6 +68,7 @@ export interface PoliceResume {
   police: string;
   fichier: string;
   client?: string;
+  clientCode?: string;
   montant: number;
   nbGaranties: number;
   exclue: boolean;
@@ -119,6 +121,7 @@ export const listerPolices = (lignes: BordereauLigne[]): PoliceResume[] => {
         police: c.police,
         fichier: c.fichier_source,
         client: c.client,
+        clientCode: c.client_code,
         montant: 0,
         nbGaranties: 0,
         exclue: true,
@@ -153,7 +156,7 @@ export const PolicesPanel: React.FC<{
   const montantExclu = round2(exclues.reduce((s, p) => s + p.montant, 0));
   const ql = q.toLowerCase();
   const visibles = polices.filter(
-    (p) => (filtre === 'TOUTES' || p.exclue) && (!ql || p.police.toLowerCase().includes(ql) || (p.client || '').toLowerCase().includes(ql))
+    (p) => (filtre === 'TOUTES' || p.exclue) && (!ql || p.police.toLowerCase().includes(ql) || (p.client || '').toLowerCase().includes(ql) || (p.clientCode || '').toLowerCase().includes(ql))
   );
   const fmt = (v: number) => v.toLocaleString('fr-DZ', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return (
@@ -215,7 +218,7 @@ export const PolicesPanel: React.FC<{
               <div className="min-w-0">
                 <div className={`font-mono font-bold ${p.exclue ? 'line-through text-slate-400' : 'text-indigo-800'}`}>{p.police}</div>
                 <div className="text-[10px] text-slate-500 truncate">
-                  {p.client && `${p.client} • `}
+                  {(p.clientCode || p.client) && `${[p.clientCode, p.client].filter(Boolean).join(' ')} • `}
                   {p.fichier} • {p.nbGaranties} garantie(s)
                 </div>
                 {p.dejaFacturee && <div className="text-[10px] font-bold text-rose-700">Déjà facturée — {p.dejaFacturee}</div>}
@@ -380,3 +383,47 @@ export const StatutBadge: React.FC<{ statut: StatutBordereau }> = ({ statut }) =
     {STATUT_LABEL[statut] || statut}
   </span>
 );
+
+/**
+ * Champ date au format JJ/MM/AAAA : les « / » sont placés automatiquement, la date est contrôlée
+ * (jour existant). `onValidite` signale au formulaire si la saisie peut être enregistrée.
+ */
+export const DateInput: React.FC<{
+  value: string;
+  onChange: (v: string) => void;
+  disabled?: boolean;
+  className?: string;
+  onValidite?: (ok: boolean) => void;
+}> = ({ value, onChange, disabled, className, onValidite }) => {
+  const erreur = erreurDate(value);
+  React.useEffect(() => {
+    onValidite?.(!erreur);
+  }, [erreur]);
+  return (
+    <div>
+      <div className="flex gap-1">
+        <input
+          value={value}
+          disabled={disabled}
+          inputMode="numeric"
+          maxLength={10}
+          placeholder="JJ/MM/AAAA"
+          onChange={(e) => onChange(masquerDate(e.target.value))}
+          className={`${className || ''} ${erreur ? 'border-rose-400 bg-rose-50' : ''}`}
+        />
+        {!disabled && (
+          <button
+            type="button"
+            tabIndex={-1}
+            onClick={() => onChange(aujourdhui())}
+            title="Date du jour"
+            className="px-2 rounded-lg border border-slate-200 text-[10px] font-bold text-slate-600 hover:bg-slate-100 cursor-pointer mt-1"
+          >
+            Auj.
+          </button>
+        )}
+      </div>
+      {erreur && <div className="text-[10px] text-rose-700 mt-0.5">{erreur}</div>}
+    </div>
+  );
+};

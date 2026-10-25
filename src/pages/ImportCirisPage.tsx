@@ -1136,6 +1136,7 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
                 {bordereau.id ? <StatutBadge statut={bordereau.statut} /> : <span className="text-[10px] font-bold text-amber-700">NON ENREGISTRÉ</span>}
                 {bordereau.id && modifie && <span className="text-[10px] font-bold text-amber-700">modifié depuis l'enregistrement</span>}
               </div>
+              {bordereau.client_libelle && <p className="text-xs text-slate-700">Client : {bordereau.client_libelle}</p>}
               <p className="text-xs text-slate-500">
                 {periodeLabel(bordereau.exercice, bordereau.mois)} • {bordereau.lignes.length} lignes ({nbExclues} exclue(s)) • {files.length} fichier(s)
               </p>
@@ -1312,7 +1313,9 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
                                     <span className="truncate">
                                       <strong>{c.fichier_source}</strong>
                                       {c.police && <span className="text-indigo-700"> • N° {c.police}</span>}
-                                      {c.client && <span className="text-slate-500"> • {c.client}</span>}
+                                      {(c.client_code || c.client) && (
+                                        <span className="text-slate-500"> • {[c.client_code, c.client].filter(Boolean).join(' ')}</span>
+                                      )}
                                     </span>
                                     <span className="font-mono font-bold whitespace-nowrap">{formatMontant(c.montant)}</span>
                                   </div>
@@ -1463,10 +1466,10 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
                       <span className="flex items-center gap-2 min-w-0">
                         <input type="checkbox" checked={m.choisis.includes(c.code_client)} onChange={() => basculer(c.code_client)} />
                         <span className="min-w-0">
-                          <span className="font-bold text-slate-900 block truncate">{c.designation_client || 'Sans désignation'}</span>
-                          <span className="text-slate-500 font-mono">
-                            {c.code_client} • {c.nombre_polices} police(s)
+                          <span className="font-bold text-slate-900 block truncate">
+                            <span className="font-mono">{c.code_client}</span> {c.designation_client || 'Sans désignation'}
                           </span>
+                          <span className="text-slate-500">{c.nombre_polices} police(s)</span>
                         </span>
                       </span>
                       <span className="font-mono font-bold shrink-0">{formatDZD(c.total_prime_nette)}</span>

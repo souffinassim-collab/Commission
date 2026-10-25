@@ -6,7 +6,8 @@ import { BordereauxPage } from './pages/BordereauxPage';
 import { ParametresPage } from './pages/ParametresPage';
 import { IntermediairesPage } from './pages/IntermediairesPage';
 import { DatabasePage } from './pages/DatabasePage';
-import { api } from './lib/api';
+import { api, isTauri } from './lib/api';
+import { champSuivantSurEntree } from './lib/clavier';
 import { ConfirmDialog, ConfirmState } from './components/Shared';
 
 export function App() {
@@ -45,6 +46,53 @@ export function App() {
 
   useEffect(() => {
     api.getDbInfo().then((info) => setDbInfo(info)).catch(console.error);
+  }, []);
+
+  // Fiches : Entrée passe au champ suivant (la tabulation fonctionne nativement)
+  useEffect(() => {
+    document.addEventListener('keydown', champSuivantSurEntree);
+    return () => document.removeEventListener('keydown', champSuivantSurEntree);
+  }, []);
+
+  // Fermeture du logiciel : confirmation pour éviter de quitter par erreur
+  useEffect(() => {
+    if (!isTauri()) return;
+    let retirer: (() => void) | undefined;
+    let annule = false;
+    (async () => {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      const fenetre = getCurrentWindow();
+      const un = await fenetre.onCloseRequested((event) => {
+        event.preventDefault();
+        setConfirm({
+          title: 'Quitter le logiciel ?',
+          danger: true,
+          message: (
+            <>
+              {importDirtyRef.current ? (
+                <p>
+                  <strong>Un import est en cours et son calcul n'est pas enregistré</strong> : il sera perdu si vous quittez.
+                </p>
+              ) : (
+                <p>Les bordereaux et paramètres enregistrés sont conservés dans la base de données.</p>
+              )}
+              <p className="font-bold">Voulez-vous vraiment fermer Gestion des Commissions ?</p>
+            </>
+          ),
+          confirmLabel: 'Oui, quitter',
+          cancelLabel: 'Non, rester',
+          onConfirm: async () => {
+            await fenetre.destroy();
+          },
+        });
+      });
+      if (annule) un();
+      else retirer = un;
+    })().catch(console.error);
+    return () => {
+      annule = true;
+      retirer?.();
+    };
   }, []);
 
   return (

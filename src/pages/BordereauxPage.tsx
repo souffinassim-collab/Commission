@@ -22,11 +22,13 @@ import {
 import { Bordereau, FichierBordereau, StatutBordereau } from '../types';
 import { DetailProductionView } from '../components/DetailProduction';
 import { api, errMsg, formatDZD, formatMontant, readFileAsDataUrl } from '../lib/api';
+import { formatDate, erreurDate } from '../lib/dates';
 import {
   AlerteDoubleFacturation,
   AnomaliesBadges,
   AnomaliesPanel,
   ConfirmDialog,
+  DateInput,
   ConfirmState,
   PolicesPanel,
   policeKey,
@@ -320,11 +322,10 @@ export const BordereauxPage: React.FC<{ onNouveau?: () => void }> = ({ onNouveau
             </label>
             <label className="block">
               <span className="font-bold text-slate-700">Date de facture</span>
-              <input
+              <DateInput
                 value={edition.dateFacture}
-                placeholder="JJ/MM/AAAA"
                 disabled={edition.b.statut === 'REGLE'}
-                onChange={(ev) => setEdition({ ...edition, dateFacture: ev.target.value })}
+                onChange={(v) => setEdition({ ...edition, dateFacture: v })}
                 className="w-full border border-slate-200 rounded-lg p-2 mt-1"
               />
             </label>
@@ -379,7 +380,7 @@ export const BordereauxPage: React.FC<{ onNouveau?: () => void }> = ({ onNouveau
           </button>
           <button
             onClick={enregistrerEdition}
-            disabled={savingEdition}
+            disabled={savingEdition || !!erreurDate(edition.dateFacture)}
             className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-bold cursor-pointer flex items-center gap-1.5"
           >
             <Save className="w-3.5 h-3.5" /> {savingEdition ? 'Enregistrement…' : 'Enregistrer'}
@@ -394,6 +395,7 @@ export const BordereauxPage: React.FC<{ onNouveau?: () => void }> = ({ onNouveau
     const matchSearch =
       b.numero_bordereau.toLowerCase().includes(q) ||
       (b.facture?.numero || '').toLowerCase().includes(q) ||
+      (b.client_libelle || '').toLowerCase().includes(q) ||
       b.intermediaire_nom.toLowerCase().includes(q) ||
       b.intermediaire_code.toLowerCase().includes(q);
     return matchSearch && (filterType === 'ALL' || b.type_intermediaire === filterType) && (filterStatut === 'ALL' || b.statut === filterStatut);
@@ -511,7 +513,7 @@ export const BordereauxPage: React.FC<{ onNouveau?: () => void }> = ({ onNouveau
               </div>
               <div className="text-right">
                 <div className="text-base font-black text-indigo-900">{b.numero_bordereau}</div>
-                <div className="text-xs text-slate-500">Date : {b.date_generation}</div>
+                <div className="text-xs text-slate-500">Date : {formatDate(b.date_generation)}</div>
               </div>
             </div>
             <div className="mt-4 py-2 bg-slate-100 text-center rounded border border-slate-300">
@@ -525,9 +527,10 @@ export const BordereauxPage: React.FC<{ onNouveau?: () => void }> = ({ onNouveau
                 <p>
                   <span className="font-bold text-slate-700">Code :</span> <span className="font-semibold">{b.intermediaire_code}</span>
                 </p>
-                {courtier && b.code_client && (
+                {(b.client_libelle || b.code_client) && (
                   <p>
-                    <span className="font-bold text-slate-700">Code client :</span> <span className="font-semibold">{b.code_client}</span>
+                    <span className="font-bold text-slate-700">Client :</span>{' '}
+                    <span className="font-semibold">{b.client_libelle || b.code_client}</span>
                   </p>
                 )}
               </div>
@@ -649,7 +652,7 @@ export const BordereauxPage: React.FC<{ onNouveau?: () => void }> = ({ onNouveau
                     <AnomaliesBadges anomalies={f.anomalies} />
                     <span className="text-slate-500">
                       {f.client_nom && `${f.client_nom} `}
-                      {f.periode && `• ${f.periode} `}• {f.nb_lignes} lignes • {taille(f.taille)} • ajouté le {f.date_ajout}
+                      {f.periode && `• ${f.periode} `}• {f.nb_lignes} lignes • {taille(f.taille)} • ajouté le {formatDate(f.date_ajout)}
                     </span>
                     {f.selection && <span className="text-indigo-700 font-semibold">{f.selection}</span>}
                   </span>
@@ -675,7 +678,7 @@ export const BordereauxPage: React.FC<{ onNouveau?: () => void }> = ({ onNouveau
             {pieces.map((f) => (
               <div key={f.id} className="flex items-center justify-between p-3 rounded-xl border border-slate-200 text-xs">
                 <span>
-                  <strong>{f.nom_fichier}</strong> <span className="text-slate-500">• {taille(f.taille)} • {f.date_ajout}</span>
+                  <strong>{f.nom_fichier}</strong> <span className="text-slate-500">• {taille(f.taille)} • {formatDate(f.date_ajout)}</span>
                 </span>
                 <span className="flex items-center gap-1">
                   <button onClick={() => ouvrirFichier(f)} className="p-1.5 rounded-lg hover:bg-slate-100 cursor-pointer" title="Ouvrir">
@@ -789,6 +792,11 @@ export const BordereauxPage: React.FC<{ onNouveau?: () => void }> = ({ onNouveau
                     <td className="px-4 py-3">
                       <div className="font-bold text-slate-900">{b.intermediaire_nom}</div>
                       <div className="text-[10px] text-slate-400 font-mono">Code : {b.intermediaire_code}</div>
+                      {(b.client_libelle || b.code_client) && (
+                        <div className="text-[10px] text-slate-600 truncate max-w-64" title={b.client_libelle || b.code_client}>
+                          Client : {b.client_libelle || b.code_client}
+                        </div>
+                      )}
                     </td>
                     <td className="px-4 py-3 font-bold">{b.type_intermediaire}</td>
                     <td className="px-4 py-3 text-center">
