@@ -41,27 +41,68 @@ fn en_amounts(line: &str) -> Vec<f64> {
     line.split_whitespace().filter_map(parse_en_amount).collect()
 }
 
-/// Montants au format français "1.234,56" (PDF de flotte). Tolère un texte collé avant/après.
+/// Montants au format français "1.234,56" ou "-1.234,56" (PDF de flotte).
+/// Gère les montants négatifs (ristournes), les nombres collés (ex: "-645,94-95,34"),
+/// les tirets Unicode (U+2212, U+2013), et le texte collé avant/après.
 fn fr_amounts(text: &str) -> Vec<f64> {
+    let s = text
+        .replace('\u{2212}', "-")
+        .replace('\u{2013}', "-")
+        .replace('\u{2014}', "-")
+        .replace('\u{00A0}', " ");
+    let bytes = s.as_bytes();
+    let n = bytes.len();
     let mut out = Vec::new();
-    for w in text.split_whitespace() {
-        let start = match w.find(|c: char| c.is_ascii_digit() || c == '-') {
-            Some(s) => s,
-            None => continue,
-        };
-        let rest = &w[start..];
-        let end = rest
-            .find(|c: char| !(c.is_ascii_digit() || c == ',' || c == '.' || c == '-'))
-            .unwrap_or(rest.len());
-        let num = &rest[..end];
-        if let Some(comma) = num.rfind(',') {
-            if num.len() - comma - 1 == 2 && num.matches(',').count() == 1 {
-                let s = num[..comma].replace('.', "") + "." + &num[comma + 1..];
-                if let Ok(v) = s.parse::<f64>() {
-                    out.push(v);
+    let mut i = 0;
+
+    while i < n {
+        if bytes[i] == b',' {
+            let c_idx = i;
+            // Vérifier qu'il y a exactement 2 chiffres décimaux après la virgule
+            if c_idx + 2 < n && bytes[c_idx + 1].is_ascii_digit() && bytes[c_idx + 2].is_ascii_digit() {
+                let c3_is_digit = c_idx + 3 < n && bytes[c_idx + 3].is_ascii_digit();
+                if !c3_is_digit {
+                    // Remonter vers l'arrière pour trouver le début du nombre
+                    let mut start = c_idx;
+                    while start > 0 {
+                        let prev = bytes[start - 1];
+                        if prev.is_ascii_digit() {
+                            start -= 1;
+                        } else if prev == b'.' && start >= 2 && bytes[start - 2].is_ascii_digit() {
+                            start -= 1;
+                        } else if prev == b'-' {
+                            start -= 1;
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Nettoyer les points orphelins au début
+                    while start < c_idx && bytes[start] == b'.' {
+                        start += 1;
+                    }
+                    if bytes[start] == b'-' && (start + 1 >= c_idx || !bytes[start + 1].is_ascii_digit()) {
+                        start += 1;
+                    }
+
+                    if start < c_idx && bytes[start..c_idx].iter().any(|b| b.is_ascii_digit()) {
+                        let end = c_idx + 3;
+                        let slice = &s[start..end];
+                        // Remplacer les séparateurs de milliers '.' et mettre le point décimal
+                        let integer_part = &slice[..slice.len() - 3].replace('.', "");
+                        let decimal_part = &slice[slice.len() - 2..];
+                        let norm = format!("{}.{}", integer_part, decimal_part);
+                        if let Ok(v) = norm.parse::<f64>() {
+                            out.push(v);
+                            i = end;
+                            continue;
+                        }
+                    }
                 }
             }
         }
+        i += 1;
     }
     out
 }
@@ -688,9 +729,9 @@ impl FlottePdfParser {
             match pages.iter().rev().find(|p| p.contains("Prime nette")) {
                 Some(p) => {
                     let idx = p.rfind("Prime nette").unwrap_or(0);
-                    let from = p[..idx].rfind('\n').unwrap_or(0);
-                    let to = p[idx..].find('\n').map(|x| idx + x).unwrap_or(p.len());
-                    let recap = fr_amounts(&p[from..to]);
+                    let window_start = idx.saturating_sub(150);
+                    let window_end = (idx + 350).min(p.len());
+                    let recap = fr_amounts(&p[window_start..window_end]);
                     if !recap.iter().any(|v| (v - total).abs() < TOLERANCE) {
                         anomalies.push(Anomalie::erreur(format!(
                             "Total des garanties lues {} introuvable dans le récapitulatif « Prime nette » du PDF ({}).",
@@ -1351,6 +1392,13 @@ pub mod tests {
         assert_eq!(parse_en_amount("2,272,025.22"), Some(2272025.22));
         assert_eq!(parse_en_amount("01/05/2025"), None);
         assert_eq!(fr_amounts("VPT - Personnes 1.412,06 400,00 48,00"), vec![1412.06, 400.0, 48.0]);
+        // Ristournes négatives et nombres collés sans espace
+        assert_eq!(
+            fr_amounts("-645,94-95,34-5.720,55 0,00-158,90-63,56-635,62-508,49-762,74"),
+            vec![-645.94, -95.34, -5720.55, 0.0, -158.90, -63.56, -635.62, -508.49, -762.74]
+        );
+        // Tirets Unicode
+        assert_eq!(fr_amounts("−8.591,14 –17,88"), vec![-8591.14, -17.88]);
     }
 
     #[test]
@@ -1410,6 +1458,49 @@ pub mod tests {
             assert!(res.items.iter().all(|i| i.police.is_some() && i.code_ministeriel.as_deref() == Some("3.1.0.2")));
             assert_eq!(res.code.as_deref(), Some("347024203/0"));
         }
+    }
+
+    #[test]
+    fn test_flotte_negative_ristourne() {
+        let text = r#"
+COMPAGNIE ALGERIENNE DES ASSURANCES
+N° Police: 2025-347 / VF / 316 / 0 / 21(3.1.0.2)
+Assuré: SARL TAHRAOUI (2224 / 0)
+Code Ministériel: 3.1.0.2
+SUCCURSALE GHARDAIA
+VRC - Responsabilité Civile
+VDR - Défense Et Recours
+VTR - Tous Risques
+VVA - Vol Autoradio
+VBDG - Bris De Glaces
+VPT - Personnes Transportées
+VASS - Assistance
+VINV - Incendie de Véhicule
+VOLV - Vol de Véhicule
+-645,94-95,34-5.720,55 0,00-158,90-63,56-635,62-508,49-762,74
+CPO FGA
+Skoda / Octavia 102190-117-16 07/09/2025 31/12/2025 -8.591,14 50 -17,88 0,00
+Détail Assurance Automobile Entreprise
+Prime nette:
+ 60,00
+ 50,00
+-8.591,14
+-1.622,82
+Prime totale: -10.121,84
+"#;
+        let pages = vec![text.to_string()];
+        let known = vec![
+            "VRC".to_string(), "VDR".to_string(), "VTR".to_string(), "VVA".to_string(),
+            "VBDG".to_string(), "VPT".to_string(), "VASS".to_string(), "VINV".to_string(),
+            "VOLV".to_string(),
+        ];
+        let res = FlottePdfParser::parse_pages(&pages, "347-vf-316-0-21.PDF", &known);
+        assert!(!res.anomalies.iter().any(|a| a.est_bloquante()), "Anomalies: {:?}", res.anomalies);
+        assert_eq!(res.items.len(), 8); // 8 garanties non nulles (VVA est à 0.00)
+        assert_eq!(res.total_prime_nette, -8591.14);
+        assert!(res.items.iter().all(|i| i.police.as_deref() == Some("347/VF/316/0/21")));
+        assert_eq!(res.code.as_deref(), Some("2224/0"));
+        assert_eq!(res.courtier_ou_client.as_deref(), Some("SARL TAHRAOUI"));
     }
 
     #[test]
