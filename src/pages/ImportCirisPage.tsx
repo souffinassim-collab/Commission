@@ -125,6 +125,10 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
   const [branches, setBranches] = useState<BrancheParam[]>([]);
   const [interId, setInterId] = useState<number | null>(null);
   const [exercice, setExercice] = useState<number>(new Date().getFullYear());
+  const [exerciceTexte, setExerciceTexte] = useState<string>(String(new Date().getFullYear()));
+  useEffect(() => {
+    setExerciceTexte(String(exercice));
+  }, [exercice]);
   const [mois, setMois] = useState<number | undefined>(undefined);
   const [tvaTaux, setTvaTaux] = useState<number>(0.19);
   const [cumul, setCumul] = useState<boolean>(true);
@@ -298,7 +302,12 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
         }
         const modal: ExcelModalState = { scan, source, etape: 'points', choisis: [], search: '', chargement: false };
         setExcelModal(modal);
-        if (scan.points_vente.length === 1) await ouvrirClientsPointVente(modal, scan.points_vente[0]);
+        const agenceCourtier =
+          interCourant?.type_intermediaire === 'COURTIER' && interCourant.code_agence
+            ? scan.points_vente.find((p) => p.code.toUpperCase() === interCourant.code_agence!.trim().toUpperCase())
+            : undefined;
+        if (agenceCourtier) await ouvrirClientsPointVente(modal, agenceCourtier);
+        else if (scan.points_vente.length === 1) await ouvrirClientsPointVente(modal, scan.points_vente[0]);
         return;
       }
 
@@ -397,6 +406,33 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
   const processSourceRef = useRef(processSource);
   processSourceRef.current = processSource;
 
+  // File d'attente : les fichiers déposés ensemble (ou coup sur coup) sont analysés un par un,
+  // jamais en parallèle — sinon les analyses se concurrencent et l'interface se fige.
+  const fileAttenteRef = useRef<Promise<void>>(Promise.resolve());
+  const compteurRef = useRef({ total: 0, fait: 0 });
+  const [progression, setProgression] = useState<{ courant: number; total: number; nom: string } | null>(null);
+  const enfilerFichiers = (taches: { name: string; source: () => Promise<FileSource> | FileSource }[]) => {
+    if (!taches.length) return;
+    compteurRef.current.total += taches.length;
+    for (const t of taches) {
+      fileAttenteRef.current = fileAttenteRef.current.then(async () => {
+        const c = compteurRef.current;
+        setProgression({ courant: c.fait + 1, total: c.total, nom: t.name });
+        try {
+          await processSourceRef.current(await t.source());
+        } catch (e) {
+          setMessage({ type: 'error', text: `Import refusé (${t.name}) : ${errMsg(e)}` });
+        } finally {
+          c.fait += 1;
+          if (c.fait >= c.total) {
+            compteurRef.current = { total: 0, fait: 0 };
+            setProgression(null);
+          }
+        }
+      });
+    }
+  };
+
   // Glisser-déposer natif Tauri (enregistré une seule fois, lit l'état courant via les refs)
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -409,11 +445,13 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
           if (event.payload.type === 'over') setIsDragging(true);
           else if (event.payload.type === 'drop') {
             setIsDragging(false);
+            const taches: { name: string; source: () => FileSource }[] = [];
             for (const p of event.payload.paths || []) {
               const name = p.split(/[\\/]/).pop() || p;
-              if (/\.(pdf|xlsx?)$/i.test(name)) await processSourceRef.current({ kind: 'path', path: p, name });
+              if (/\.(pdf|xlsx?)$/i.test(name)) taches.push({ name, source: () => ({ kind: 'path', path: p, name }) });
               else setMessage({ type: 'error', text: `Format ignoré : ${name}. Formats acceptés : PDF (CIRIS / flotte) et Excel.` });
             }
+            enfilerFichiers(taches);
           } else setIsDragging(false);
         });
         if (disposed) un();
@@ -430,10 +468,12 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
 
   const handleBrowserFiles = async (list: FileList | null) => {
     if (!list) return;
-    for (const f of Array.from(list)) {
-      const base64 = await readFileAsDataUrl(f);
-      await processSource({ kind: 'blob', base64, name: f.name });
-    }
+    enfilerFichiers(
+      Array.from(list).map((f) => ({
+        name: f.name,
+        source: async (): Promise<FileSource> => ({ kind: 'blob', base64: await readFileAsDataUrl(f), name: f.name }),
+      }))
+    );
   };
 
   // --- Sélection dans un registre Excel : point de vente, puis clients éventuels (courtier) ---
@@ -454,8 +494,13 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
   };
 
   /** Intermédiaire enregistré dont le code est celui du point de vente */
-  const interDuPointVente = (code: string) =>
-    intermediaires.find((i) => i.code.trim().toUpperCase() === code.trim().toUpperCase());
+  const interDuPointVente = (code: string) => {
+    const c = code.trim().toUpperCase();
+    return (
+      intermediaires.find((i) => i.type_intermediaire === 'AGA' && (i.code_agence || i.code).trim().toUpperCase() === c) ||
+      intermediaires.find((i) => i.code.trim().toUpperCase() === c)
+    );
+  };
 
   const handleRemoveFile = (f: UploadedFileResult) => {
     setConfirm({
@@ -549,6 +594,7 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
       departement: (modele?.departement || '').trim() || 'Département Commercial',
       tva_applicable: modele?.tva_applicable ?? 0.19,
       actif: true,
+      code_agence: type === 'AGA' ? code : '',
     };
   };
 
@@ -825,7 +871,16 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
   };
 
   const nbExclues = bordereau?.lignes.filter((l) => !ligneActive(l)).length || 0;
-  const annees = Array.from({ length: 8 }, (_, i) => new Date().getFullYear() + 1 - i);
+  // Exercice : saisie libre (dossiers anciens, ex. 2012), suggestions de 2000 à l'année prochaine
+  const anneeMax = new Date().getFullYear() + 1;
+  const annees = Array.from({ length: anneeMax - 2000 + 1 }, (_, i) => anneeMax - i);
+  const exerciceNum = Number(exerciceTexte);
+  const erreurExercice =
+    exerciceTexte.length !== 4 || !Number.isInteger(exerciceNum)
+      ? 'Année sur 4 chiffres'
+      : exerciceNum < 1990 || exerciceNum > anneeMax
+      ? `Année entre 1990 et ${anneeMax}`
+      : null;
   const inputCls =
     'w-full bg-slate-50 border border-slate-200 rounded-lg p-2 font-medium text-slate-800 focus:ring-2 focus:ring-indigo-500 focus:outline-hidden disabled:opacity-60 disabled:cursor-not-allowed';
 
@@ -896,7 +951,7 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
                 .filter((i) => i.actif || i.id === interId)
                 .map((i) => (
                   <option key={i.id} value={i.id}>
-                    {i.type_intermediaire} · {i.code} · {i.nom}
+                    {i.code} · {i.nom} · Agence {i.code_agence || (i.type_intermediaire === 'AGA' ? i.code : '—')} ({i.type_intermediaire})
                   </option>
                 ))}
             </select>
@@ -913,14 +968,30 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
           <div className="grid grid-cols-2 gap-2">
             <div>
               <label className="block font-semibold text-slate-600 mb-1">Exercice</label>
-              <select value={exercice} disabled={locked} onChange={(e) => setExercice(Number(e.target.value))} className={inputCls}>
-                {!annees.includes(exercice) && <option value={exercice}>{exercice}</option>}
+              <input
+                value={exerciceTexte}
+                disabled={locked}
+                list="exercices-proposes"
+                inputMode="numeric"
+                maxLength={4}
+                placeholder="AAAA"
+                onChange={(e) => {
+                  const t = e.target.value.replace(/\D/g, '').slice(0, 4);
+                  setExerciceTexte(t);
+                  const n = Number(t);
+                  if (t.length === 4 && n >= 1990 && n <= anneeMax) setExercice(n);
+                }}
+                onBlur={() => {
+                  if (erreurExercice) setExerciceTexte(String(exercice));
+                }}
+                className={`${inputCls} ${erreurExercice ? 'border-rose-400 bg-rose-50' : ''}`}
+              />
+              <datalist id="exercices-proposes">
                 {annees.map((a) => (
-                  <option key={a} value={a}>
-                    {a}
-                  </option>
+                  <option key={a} value={a} />
                 ))}
-              </select>
+              </datalist>
+              {erreurExercice && <div className="text-[10px] text-rose-700 mt-0.5">{erreurExercice}</div>}
             </div>
             <div>
               <label className="block font-semibold text-slate-600 mb-1">Mois</label>
@@ -1004,7 +1075,11 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
           >
             <UploadCloud className="w-8 h-8 text-indigo-600 mb-2" />
             <h3 className="text-sm font-bold text-slate-800">
-              {loading
+              {progression
+                ? progression.total > 1
+                  ? `Analyse du fichier ${progression.courant}/${progression.total} : ${progression.nom}…`
+                  : `Analyse de ${progression.nom}…`
+                : loading
                 ? 'Analyse en cours…'
                 : inter
                 ? `Déposez les fichiers de ${inter.nom} (${periodeLabel(exercice, mois)})`
@@ -1468,6 +1543,7 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
                         <span className="min-w-0">
                           <span className="font-bold text-slate-900 block truncate">
                             <span className="font-mono">{c.code_client}</span> {c.designation_client || 'Sans désignation'}
+                            {m.pv && <span className="font-normal text-slate-500"> · Agence {m.pv.code}</span>}
                           </span>
                           <span className="text-slate-500">{c.nombre_polices} police(s)</span>
                         </span>
@@ -1730,7 +1806,7 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
                       .filter((i) => i.actif)
                       .map((i) => (
                         <option key={i.id} value={i.id}>
-                          {i.code} · {i.nom} ({i.type_intermediaire})
+                          {i.code} · {i.nom} · Agence {i.code_agence || (i.type_intermediaire === 'AGA' ? i.code : '—')} ({i.type_intermediaire})
                         </option>
                       ))}
                   </select>

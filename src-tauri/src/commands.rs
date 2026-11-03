@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use serde::Deserialize;
-use tauri::State;
+use tauri::{Manager, State};
 use crate::calculation::CalculationEngine;
 use crate::db::{DatabaseManager, ImportAEnregistrer};
 use crate::export::ExcelExporter;
@@ -66,8 +66,45 @@ fn file_name_of(path: &str) -> String {
     PathBuf::from(path).file_name().and_then(|n| n.to_str()).unwrap_or("fichier").to_string()
 }
 
+/// Lecture d'un fichier dans un fil dédié (pile de 64 Mo pour les PDF complexes) : une erreur interne
+/// pendant la lecture devient un message « fichier illisible » au lieu de fermer l'application.
+pub fn lecture_protegee<T: Send>(file_name: &str, f: impl FnOnce() -> Result<T, String> + Send) -> Result<T, String> {
+    let resultat = std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .name("lecture-fichier".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn_scoped(s, || std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)))
+            .map(|h| h.join())
+    });
+    let detail = |p: Box<dyn std::any::Any + Send>| {
+        p.downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "erreur inconnue".into())
+    };
+    match resultat {
+        Ok(Ok(Ok(r))) => r,
+        Ok(Ok(Err(p))) | Ok(Err(p)) => Err(format!(
+            "« {} » n'a pas pu être lu : sa mise en forme n'est pas prise en charge ({}). L'application n'a pas été affectée ; transmettez ce fichier et le journal erreurs.log pour correction.",
+            file_name,
+            detail(p)
+        )),
+        Err(e) => Err(format!("Impossible de lancer la lecture de « {} » : {}", file_name, e)),
+    }
+}
+
 /// Analyse d'un fichier selon son type (détection sur le contenu pour les PDF)
 fn parse_file_auto_bytes(
+    bytes: &[u8],
+    file_name: &str,
+    selection: &ExcelSelection,
+    periode: Option<PeriodeBordereau>,
+    known_codes: &[String],
+) -> Result<UploadedFileResult, String> {
+    lecture_protegee(file_name, || parse_file_auto_bytes_brut(bytes, file_name, selection, periode, known_codes))
+}
+
+fn parse_file_auto_bytes_brut(
     bytes: &[u8],
     file_name: &str,
     selection: &ExcelSelection,
@@ -172,17 +209,22 @@ fn validate_against_context(
 
 /// Relance les contrôles de contexte (après identification de l'intermédiaire ou changement de période)
 #[tauri::command]
-pub fn revalider_fichiers(
+pub async fn revalider_fichiers(
+    app: tauri::AppHandle,
     fichiers: Vec<UploadedFileResult>,
     ctx: ImportContext,
-    state: State<'_, AppState>,
 ) -> Result<Vec<UploadedFileResult>, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let mut out = fichiers;
-    for f in out.iter_mut() {
-        validate_against_context(&db, f, &ctx)?;
-    }
-    Ok(out)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let mut out = fichiers;
+        for f in out.iter_mut() {
+            validate_against_context(&db, f, &ctx)?;
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 fn analyse_et_met_en_attente(
@@ -192,12 +234,14 @@ fn analyse_et_met_en_attente(
     selection: &ExcelSelection,
     ctx: &ImportContext,
 ) -> Result<UploadedFileResult, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let known = db.known_sous_codes()?;
+    // La base n'est verrouillée que le temps de lire les sous-codes puis de valider : la lecture du fichier
+    // (plusieurs secondes pour un gros PDF) ne bloque pas les autres opérations
+    let known = state.db.lock().map_err(|e| e.to_string())?.known_sous_codes()?;
     let periode = Some(PeriodeBordereau { exercice: ctx.exercice, mois: ctx.mois });
     let mut res = parse_file_auto_bytes(&bytes, file_name, selection, periode, &known)?;
     res.hash = sha256_hex(&bytes);
     res.taille = bytes.len() as i64;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
     validate_against_context(&db, &mut res, ctx)?;
     drop(db);
     state
@@ -218,9 +262,16 @@ pub fn get_db_info(state: State<'_, AppState>) -> Result<DbInfo, String> {
 }
 
 #[tauri::command]
-pub fn backup_database(state: State<'_, AppState>) -> Result<String, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    Ok(db.create_pre_migration_backup()?.to_string_lossy().to_string())
+pub async fn backup_database(
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        Ok(db.create_pre_migration_backup()?.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -298,31 +349,41 @@ pub fn delete_intermediaire(id: i64, state: State<'_, AppState>) -> Result<(), S
 // ---------------------------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn parse_file_auto(
+pub async fn parse_file_auto(
+    app: tauri::AppHandle,
     file_path: String,
     selection: Option<ExcelSelection>,
     ctx: ImportContext,
-    state: State<'_, AppState>,
 ) -> Result<UploadedFileResult, String> {
-    let bytes = fs::read(&file_path).map_err(|e| format!("Impossible de lire le fichier: {}", e))?;
-    analyse_et_met_en_attente(&state, bytes, &file_name_of(&file_path), &selection.unwrap_or_default(), &ctx)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let bytes = fs::read(&file_path).map_err(|e| format!("Impossible de lire le fichier: {}", e))?;
+        analyse_et_met_en_attente(&state, bytes, &file_name_of(&file_path), &selection.unwrap_or_default(), &ctx)
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 #[tauri::command]
-pub fn parse_file_auto_base64(
+pub async fn parse_file_auto_base64(
+    app: tauri::AppHandle,
     base64_data: String,
     file_name: String,
     selection: Option<ExcelSelection>,
     ctx: ImportContext,
-    state: State<'_, AppState>,
 ) -> Result<UploadedFileResult, String> {
-    let bytes = decode_base64_payload(&base64_data)?;
-    analyse_et_met_en_attente(&state, bytes, &file_name, &selection.unwrap_or_default(), &ctx)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let bytes = decode_base64_payload(&base64_data)?;
+        analyse_et_met_en_attente(&state, bytes, &file_name, &selection.unwrap_or_default(), &ctx)
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 /// Registre Excel : analyse (points de vente) ; le classeur reste en mémoire pour la sélection
 fn analyser_et_garder(state: &State<'_, AppState>, bytes: Vec<u8>, file_name: &str) -> Result<ExcelScanResult, String> {
-    let mut scan = ExcelProductionParser::scan_from_bytes(&bytes, file_name)?;
+    let mut scan = lecture_protegee(file_name, || ExcelProductionParser::scan_from_bytes(&bytes, file_name))?;
     scan.staging_id = format!("classeur-{}", chrono::Local::now().timestamp_micros());
     state
         .en_attente
@@ -341,42 +402,65 @@ fn classeur_en_attente(state: &State<'_, AppState>, staging_id: &str) -> Result<
 }
 
 #[tauri::command]
-pub fn analyser_classeur(file_path: String, state: State<'_, AppState>) -> Result<ExcelScanResult, String> {
-    let bytes = fs::read(&file_path).map_err(|e| format!("Impossible de lire le fichier: {}", e))?;
-    analyser_et_garder(&state, bytes, &file_name_of(&file_path))
+pub async fn analyser_classeur(
+    app: tauri::AppHandle,
+    file_path: String,
+) -> Result<ExcelScanResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let bytes = fs::read(&file_path).map_err(|e| format!("Impossible de lire le fichier: {}", e))?;
+        analyser_et_garder(&state, bytes, &file_name_of(&file_path))
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 #[tauri::command]
-pub fn analyser_classeur_base64(
+pub async fn analyser_classeur_base64(
+    app: tauri::AppHandle,
     base64_data: String,
     file_name: String,
-    state: State<'_, AppState>,
 ) -> Result<ExcelScanResult, String> {
-    let bytes = decode_base64_payload(&base64_data)?;
-    analyser_et_garder(&state, bytes, &file_name)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let bytes = decode_base64_payload(&base64_data)?;
+        analyser_et_garder(&state, bytes, &file_name)
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 /// Clients d'un point de vente du classeur analysé (un par code, sans doublon)
 #[tauri::command]
-pub fn clients_point_vente(
+pub async fn clients_point_vente(
+    app: tauri::AppHandle,
     staging_id: String,
     point_vente: String,
-    state: State<'_, AppState>,
 ) -> Result<Vec<ExcelClientSummary>, String> {
-    let (bytes, _) = classeur_en_attente(&state, &staging_id)?;
-    ExcelProductionParser::clients_from_bytes(&bytes, &point_vente)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let (bytes, nom) = classeur_en_attente(&state, &staging_id)?;
+        lecture_protegee(&nom, || ExcelProductionParser::clients_from_bytes(&bytes, &point_vente))
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 /// Import de la sélection faite dans le classeur analysé (point de vente, clients éventuels)
 #[tauri::command]
-pub fn importer_classeur(
+pub async fn importer_classeur(
+    app: tauri::AppHandle,
     staging_id: String,
     selection: ExcelSelection,
     ctx: ImportContext,
-    state: State<'_, AppState>,
 ) -> Result<UploadedFileResult, String> {
-    let (bytes, nom) = classeur_en_attente(&state, &staging_id)?;
-    analyse_et_met_en_attente(&state, bytes, &nom, &selection, &ctx)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let (bytes, nom) = classeur_en_attente(&state, &staging_id)?;
+        analyse_et_met_en_attente(&state, bytes, &nom, &selection, &ctx)
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 /// Abandon de l'import en cours : libère les fichiers en attente
@@ -390,14 +474,19 @@ pub fn clear_pending_files(ids: Vec<String>, state: State<'_, AppState>) -> Resu
 }
 
 #[tauri::command]
-pub fn calculate_multi_bordereau(
+pub async fn calculate_multi_bordereau(
+    app: tauri::AppHandle,
     req: CalculateMultiBordereauRequest,
-    state: State<'_, AppState>,
 ) -> Result<Bordereau, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let branches = db.get_all_branches()?;
-    let deja = db.polices_commissionnees(req.bordereau_id)?;
-    Ok(CalculationEngine::compute_multi_bordereau(&req, &branches, &deja))
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let branches = db.get_all_branches()?;
+        let deja = db.polices_commissionnees(req.bordereau_id)?;
+        Ok(CalculationEngine::compute_multi_bordereau(&req, &branches, &deja))
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -405,51 +494,56 @@ pub fn calculate_multi_bordereau(
 // ---------------------------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn save_bordereau(
+pub async fn save_bordereau(
+    app: tauri::AppHandle,
     bordereau: Bordereau,
     fichiers: Option<Vec<UploadedFileResult>>,
-    state: State<'_, AppState>,
 ) -> Result<i64, String> {
-    let mut bordereau = bordereau;
-    if let Some(a) = bordereau.anomalies_bloquantes().first() {
-        return Err(format!("Enregistrement impossible : {}", a.message));
-    }
-    // Contrôles de contexte rejoués côté serveur : intermédiaire, période, fichier déjà commissionné
-    let mut fichiers = fichiers;
-    if let Some(list) = fichiers.as_mut() {
-        let ctx = ImportContext {
-            intermediaire_id: bordereau.intermediaire_id,
-            exercice: bordereau.exercice,
-            mois: bordereau.mois,
-            bordereau_id: bordereau.id,
-        };
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let mut bordereau = bordereau;
+        if let Some(a) = bordereau.anomalies_bloquantes().first() {
+            return Err(format!("Enregistrement impossible : {}", a.message));
+        }
+        // Contrôles de contexte rejoués côté serveur : intermédiaire, période, fichier déjà commissionné
+        let mut fichiers = fichiers;
+        if let Some(list) = fichiers.as_mut() {
+            let ctx = ImportContext {
+                intermediaire_id: bordereau.intermediaire_id,
+                exercice: bordereau.exercice,
+                mois: bordereau.mois,
+                bordereau_id: bordereau.id,
+            };
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            for f in list.iter_mut() {
+                validate_against_context(&db, f, &ctx)?;
+            }
+        }
+        // Cohérence montants/totaux à partir des taux figés dans chaque ligne (le barème n'est pas relu)
+        CalculationEngine::recompute_bordereau(&mut bordereau);
+
+        let en_attente = state.en_attente.lock().map_err(|e| e.to_string())?;
+        let imports: Option<Vec<ImportAEnregistrer>> = fichiers.as_ref().map(|list| {
+            list.iter()
+                .map(|f| ImportAEnregistrer { fichier: f, contenu: en_attente.get(&f.id).map(|p| p.contenu.clone()) })
+                .collect()
+        });
+        drop(en_attente);
+
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        for f in list.iter_mut() {
-            validate_against_context(&db, f, &ctx)?;
+        let id = db.save_bordereau(&bordereau, imports.as_deref())?;
+        drop(db);
+
+        if let Some(list) = fichiers {
+            let mut map = state.en_attente.lock().map_err(|e| e.to_string())?;
+            for f in list {
+                map.remove(&f.id);
+            }
         }
-    }
-    // Cohérence montants/totaux à partir des taux figés dans chaque ligne (le barème n'est pas relu)
-    CalculationEngine::recompute_bordereau(&mut bordereau);
-
-    let en_attente = state.en_attente.lock().map_err(|e| e.to_string())?;
-    let imports: Option<Vec<ImportAEnregistrer>> = fichiers.as_ref().map(|list| {
-        list.iter()
-            .map(|f| ImportAEnregistrer { fichier: f, contenu: en_attente.get(&f.id).map(|p| p.contenu.clone()) })
-            .collect()
-    });
-    drop(en_attente);
-
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let id = db.save_bordereau(&bordereau, imports.as_deref())?;
-    drop(db);
-
-    if let Some(list) = fichiers {
-        let mut map = state.en_attente.lock().map_err(|e| e.to_string())?;
-        for f in list {
-            map.remove(&f.id);
-        }
-    }
-    Ok(id)
+        Ok(id)
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 #[tauri::command]
@@ -458,8 +552,17 @@ pub fn get_bordereaux(state: State<'_, AppState>) -> Result<Vec<Bordereau>, Stri
 }
 
 #[tauri::command]
-pub fn get_bordereau(id: i64, state: State<'_, AppState>) -> Result<Option<Bordereau>, String> {
-    state.db.lock().map_err(|e| e.to_string())?.get_bordereau_by_id(id)
+pub async fn get_bordereau(
+    app: tauri::AppHandle,
+    id: i64,
+) -> Result<Option<Bordereau>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.get_bordereau_by_id(id)
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 #[tauri::command]
@@ -477,22 +580,36 @@ pub fn delete_bordereau(id: i64, state: State<'_, AppState>) -> Result<(), Strin
 // ---------------------------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn add_piece_jointe(bordereau_id: i64, file_path: String, state: State<'_, AppState>) -> Result<i64, String> {
-    let bytes = fs::read(&file_path).map_err(|e| format!("Impossible de lire le fichier: {}", e))?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.add_piece_jointe(bordereau_id, &file_name_of(&file_path), &sha256_hex(&bytes), &bytes)
+pub async fn add_piece_jointe(
+    app: tauri::AppHandle,
+    bordereau_id: i64,
+    file_path: String,
+) -> Result<i64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let bytes = fs::read(&file_path).map_err(|e| format!("Impossible de lire le fichier: {}", e))?;
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.add_piece_jointe(bordereau_id, &file_name_of(&file_path), &sha256_hex(&bytes), &bytes)
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 #[tauri::command]
-pub fn add_piece_jointe_base64(
+pub async fn add_piece_jointe_base64(
+    app: tauri::AppHandle,
     bordereau_id: i64,
     file_name: String,
     base64_data: String,
-    state: State<'_, AppState>,
 ) -> Result<i64, String> {
-    let bytes = decode_base64_payload(&base64_data)?;
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.add_piece_jointe(bordereau_id, &file_name, &sha256_hex(&bytes), &bytes)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let bytes = decode_base64_payload(&base64_data)?;
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.add_piece_jointe(bordereau_id, &file_name, &sha256_hex(&bytes), &bytes)
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 #[tauri::command]
@@ -508,41 +625,54 @@ fn safe_name(s: &str) -> String {
 
 /// Extrait un fichier rattaché dans Exports/<numéro de bordereau>/ et l'ouvre avec l'application associée
 #[tauri::command]
-pub fn ouvrir_fichier(fichier_id: i64, state: State<'_, AppState>) -> Result<String, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let (nom, bordereau_id, contenu) = db.get_fichier_contenu(fichier_id)?;
-    let numero = db
-        .get_bordereau_by_id(bordereau_id)?
-        .map(|b| b.numero_bordereau)
-        .unwrap_or_else(|| format!("bordereau_{}", bordereau_id));
-    let dir = db.exports_directory().join(safe_name(&numero));
-    drop(db);
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(safe_name(&nom));
-    fs::write(&path, contenu).map_err(|e| format!("Écriture impossible : {}", e))?;
-    tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| format!("Ouverture impossible : {}", e))?;
-    Ok(path.to_string_lossy().to_string())
+pub async fn ouvrir_fichier(
+    app: tauri::AppHandle,
+    fichier_id: i64,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let (nom, bordereau_id, contenu) = db.get_fichier_contenu(fichier_id)?;
+        let numero = db
+            .get_bordereau_by_id(bordereau_id)?
+            .map(|b| b.numero_bordereau)
+            .unwrap_or_else(|| format!("bordereau_{}", bordereau_id));
+        let dir = db.exports_directory().join(safe_name(&numero));
+        drop(db);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(safe_name(&nom));
+        fs::write(&path, contenu).map_err(|e| format!("Écriture impossible : {}", e))?;
+        tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| format!("Ouverture impossible : {}", e))?;
+        Ok(path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 #[tauri::command]
-pub fn export_excel(
+pub async fn export_excel(
+    app: tauri::AppHandle,
     bordereau: Bordereau,
     export_path: Option<String>,
-    state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let default_name = format!("Bordereau_{}.xlsx", safe_name(&bordereau.numero_bordereau));
-    // Par défaut dans le dossier "Exports" à côté de BDD (et non le répertoire courant,
-    // qui en mode dev est src-tauri et relancerait l'application via le watcher)
-    let target_path = match export_path {
-        Some(p) => PathBuf::from(p),
-        None => {
-            let db = state.db.lock().map_err(|e| e.to_string())?;
-            db.exports_directory().join(default_name)
-        }
-    };
-    ExcelExporter::export_bordereau_to_file(&bordereau, &target_path)
-        .map_err(|e| format!("Erreur export Excel: {:?}", e))?;
-    Ok(target_path.to_string_lossy().to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let default_name = format!("Bordereau_{}.xlsx", safe_name(&bordereau.numero_bordereau));
+        // Par défaut dans le dossier "Exports" à côté de BDD (et non le répertoire courant,
+        // qui en mode dev est src-tauri et relancerait l'application via le watcher)
+        let target_path = match export_path {
+            Some(p) => PathBuf::from(p),
+            None => {
+                let db = state.db.lock().map_err(|e| e.to_string())?;
+                db.exports_directory().join(default_name)
+            }
+        };
+        ExcelExporter::export_bordereau_to_file(&bordereau, &target_path)
+            .map_err(|e| format!("Erreur export Excel: {:?}", e))?;
+        Ok(target_path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -551,8 +681,14 @@ pub fn export_excel(
 
 /// Détail de production à confirmer (détail par police, commission calculée / déclarée, écarts)
 #[tauri::command]
-pub fn detail_production(bordereau: Bordereau) -> Result<crate::detail::DetailProduction, String> {
-    Ok(crate::detail::construire(&bordereau))
+pub async fn detail_production(
+    bordereau: Bordereau,
+) -> Result<crate::detail::DetailProduction, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(crate::detail::construire(&bordereau))
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 /// Enregistre la facture de l'intermédiaire (numéro, date, commission HT déclarée par ligne)
@@ -567,14 +703,22 @@ pub fn enregistrer_facture_intermediaire(
 
 /// Export Excel du détail de production (même présentation que le modèle du service commercial)
 #[tauri::command]
-pub fn export_detail_production(bordereau: Bordereau, state: State<'_, AppState>) -> Result<String, String> {
-    let d = crate::detail::construire(&bordereau);
-    let path = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.exports_directory().join(format!("Detail_production_{}.xlsx", safe_name(&bordereau.numero_bordereau)))
-    };
-    ExcelExporter::export_detail_production(&d, &path).map_err(|e| format!("Erreur export Excel: {:?}", e))?;
-    Ok(path.to_string_lossy().to_string())
+pub async fn export_detail_production(
+    app: tauri::AppHandle,
+    bordereau: Bordereau,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let d = crate::detail::construire(&bordereau);
+        let path = {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            db.exports_directory().join(format!("Detail_production_{}.xlsx", safe_name(&bordereau.numero_bordereau)))
+        };
+        ExcelExporter::export_detail_production(&d, &path).map_err(|e| format!("Erreur export Excel: {:?}", e))?;
+        Ok(path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| format!("Tâche interrompue : {}", e))?
 }
 
 #[cfg(test)]
@@ -601,6 +745,7 @@ mod tests {
                 adresse: None,
                 tva_applicable: 0.19,
                 actif: true,
+                code_agence: String::new(),
             })
             .unwrap()
         };

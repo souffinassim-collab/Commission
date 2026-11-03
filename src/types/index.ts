@@ -39,6 +39,8 @@ export interface Intermediaire {
   adresse?: string;
   tva_applicable: number;
   actif: boolean;
+  /** Agence (point de vente) de rattachement : préfixe des N° de police (ex: 347). Pour un AGA : son code. */
+  code_agence?: string;
 }
 
 /** Anomalie d'import ou de calcul — ERREUR = bloquante pour l'enregistrement */

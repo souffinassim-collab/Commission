@@ -104,6 +104,9 @@ pub struct Intermediaire {
     pub adresse: Option<String>,
     pub tva_applicable: f64,
     pub actif: bool,
+    /// Agence (point de vente) de rattachement : préfixe des N° de police (ex: 347). Pour un AGA, son code.
+    #[serde(default)]
+    pub code_agence: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

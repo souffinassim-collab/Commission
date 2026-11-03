@@ -9,8 +9,33 @@ pub mod commands;
 use db::DatabaseManager;
 use commands::*;
 
+/// Journal `erreurs.log` (à côté de l'exécutable) : toute erreur interne y est notée avec sa ligne exacte
+fn installer_journal_erreurs() {
+    let defaut = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let journal = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("erreurs.log")))
+            .unwrap_or_else(|| std::path::PathBuf::from("erreurs.log"));
+        let fil = std::thread::current().name().unwrap_or("?").to_string();
+        let ligne = format!(
+            "[{}] fil {} : {}
+",
+            chrono::Local::now().format("%d/%m/%Y %H:%M:%S"),
+            fil,
+            info
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&journal) {
+            use std::io::Write;
+            let _ = f.write_all(ligne.as_bytes());
+        }
+        defaut(info);
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    installer_journal_erreurs();
     let db_manager = DatabaseManager::new()
         .unwrap_or_else(|e| panic!("Échec d'initialisation de la base SQLite dans ./BDD : {}", e));
 
@@ -99,6 +124,7 @@ mod tests {
                 adresse: None,
                 tva_applicable: 0.19,
                 actif: true,
+                code_agence: String::new(),
             })
             .unwrap();
         db.get_intermediaire(id).unwrap().unwrap()
@@ -117,6 +143,7 @@ mod tests {
                 adresse: None,
                 tva_applicable: 0.19,
                 actif: true,
+                code_agence: String::new(),
             })
             .unwrap();
         db.get_intermediaire(id).unwrap().unwrap()
@@ -152,7 +179,7 @@ mod tests {
         let db = test_db();
         let branches = db.get_all_branches().unwrap();
         assert!(branches.len() >= 70);
-        assert_eq!(db.get_info().unwrap().version, 8);
+        assert_eq!(db.get_info().unwrap().version, 9);
         let vrc = branches.iter().find(|b| b.sous_code == "VRC").unwrap();
         assert_eq!(vrc.alias_import, "VP,VO,VR");
         assert_eq!(vrc.groupe_bordereau, "RC AUTOMOBILE");
@@ -204,7 +231,7 @@ mod tests {
         drop(before);
 
         let db = DatabaseManager::with_path(&target).expect("migration");
-        assert_eq!(db.get_info().unwrap().version, 8);
+        assert_eq!(db.get_info().unwrap().version, 9);
         for b in db.get_all_bordereaux().unwrap() {
             let full = db.get_bordereau_by_id(b.id.unwrap()).unwrap().unwrap();
             assert!(full.intermediaire_id.is_some(), "bordereau {} rattaché à son intermédiaire", full.numero_bordereau);
@@ -672,6 +699,18 @@ mod tests {
         let reread = db.get_intermediaire(c.id.unwrap()).unwrap().unwrap();
         assert_eq!(reread.nom, "NOUVEAU NOM");
         assert!(!reread.actif);
+        // Code agence : un AGA est sa propre agence, un courtier garde l'agence saisie ; « / » refusé
+        let aga_id = db
+            .save_intermediaire(&Intermediaire { id: None, type_intermediaire: "AGA".into(), code: "777".into(), nom: "AGA TEST".into(), ..c.clone() })
+            .unwrap();
+        assert_eq!(db.get_intermediaire(aga_id).unwrap().unwrap().code_agence, "777");
+        let mut ca = c.clone();
+        ca.code_agence = "347".into();
+        db.save_intermediaire(&ca).unwrap();
+        assert_eq!(db.get_intermediaire(c.id.unwrap()).unwrap().unwrap().code_agence, "347");
+        ca.code_agence = "347/VF".into();
+        assert!(db.save_intermediaire(&ca).is_err());
+        db.delete_intermediaire(aga_id).unwrap();
         // Delete (aucun bordereau rattaché)
         db.delete_intermediaire(c.id.unwrap()).unwrap();
         assert!(db.get_intermediaire(c.id.unwrap()).unwrap().is_none());
@@ -878,5 +917,84 @@ mod tests {
         assert!(detail.lignes.iter().any(|l| l.code_garantie == "VRC"));
         assert_eq!(detail.total_prime_nette, 764317.19);
         assert!(detail.anomalies_bloquantes().is_empty());
+    }
+
+    /// Une erreur interne pendant la lecture devient un message ; l'application n'est jamais fermée
+    #[test]
+    fn test_lecture_protegee_rattrape_les_plantages() {
+        let r: Result<(), String> = crate::commands::lecture_protegee("casse.pdf", || {
+            let v: Vec<u8> = Vec::new();
+            let _ = v[3];
+            Ok(())
+        });
+        let e = r.unwrap_err();
+        assert!(e.contains("casse.pdf") && e.contains("pas pu être lu"), "{}", e);
+
+        // Récursion profonde (PDF très imbriqué) : la pile dédiée suffit
+        fn profond(n: u32) -> u32 {
+            let tampon = [n as u8; 512];
+            if n == 0 { tampon[0] as u32 } else { profond(n - 1) + tampon[1] as u32 }
+        }
+        assert!(crate::commands::lecture_protegee("profond.pdf", || Ok(profond(50_000))).is_ok());
+    }
+
+    /// Tous les fichiers d'exemple, entiers puis tronqués / altérés : jamais de plantage
+    #[test]
+    fn test_fichiers_abimes_sans_plantage() {
+        use crate::parser::*;
+        let mut fichiers = Vec::new();
+        for dir in ["../Docs", "../Import", "../docs", "../import"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    let n = p.file_name().unwrap().to_string_lossy().to_lowercase();
+                    if n.ends_with(".pdf") || n.ends_with(".xls") || n.ends_with(".xlsx") {
+                        fichiers.push(p);
+                    }
+                }
+            }
+        }
+        let known: Vec<String> = ["VRC", "VRCR", "VRCE", "VASS", "VDR", "VTR", "VDC", "VBDG", "VINV", "VOLV", "VPT", "VAV", "VIV"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for p in fichiers {
+            let nom = p.file_name().unwrap().to_string_lossy().to_string();
+            let bytes = std::fs::read(&p).unwrap();
+            let mut variantes = vec![bytes.clone(), bytes[..bytes.len() / 2].to_vec(), bytes[..bytes.len().min(2000)].to_vec()];
+            let mut alteree = bytes.clone();
+            for i in (0..alteree.len()).step_by(997) {
+                alteree[i] = alteree[i].wrapping_add(13);
+            }
+            variantes.push(alteree);
+            for (n, v) in variantes.into_iter().enumerate() {
+                let r = crate::commands::lecture_protegee(&nom, || {
+                    if nom.to_lowercase().ends_with(".pdf") {
+                        let doc = lopdf::Document::load_mem(&v).map_err(|e| e.to_string())?;
+                        let pages = extract_pages(&doc);
+                        if CirisPdfParser::is_ciris(&pages) {
+                            CirisPdfParser::parse_pages(&pages, &nom, &known).map(|_| ())
+                        } else {
+                            let _ = FlottePdfParser::parse_pages(&pages, &nom, &known);
+                            Ok(())
+                        }
+                    } else {
+                        let scan = ExcelProductionParser::scan_from_bytes(&v, &nom)?;
+                        for pv in &scan.points_vente {
+                            let _ = ExcelProductionParser::clients_from_bytes(&v, &pv.code);
+                        }
+                        Ok(())
+                    }
+                });
+                // Fichier intact : aucune erreur interne admise. Fichier abîmé : erreur rattrapée, jamais de fermeture.
+                if let Err(e) = &r {
+                    if n == 0 {
+                        assert!(!e.contains("pas pu être lu"), "plantage interne sur {} : {}", nom, e);
+                    } else if e.contains("pas pu être lu") {
+                        println!("rattrapé (variante {}) : {}", n, e);
+                    }
+                }
+            }
+        }
     }
 }

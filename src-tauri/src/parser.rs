@@ -733,8 +733,8 @@ impl FlottePdfParser {
                     let window_end = (idx + 350).min(p.len());
                     let recap = fr_amounts(&p[window_start..window_end]);
                     if !recap.iter().any(|v| (v - total).abs() < TOLERANCE) {
-                        anomalies.push(Anomalie::erreur(format!(
-                            "Total des garanties lues {} introuvable dans le récapitulatif « Prime nette » du PDF ({}).",
+                        anomalies.push(Anomalie::avertissement(format!(
+                            "Écart récapitulatif : total des garanties lues {} ≠ « Prime nette » du récapitulatif PDF ({}).",
                             fmt_montant(total),
                             recap.iter().map(|v| fmt_montant(*v)).collect::<Vec<_>>().join(" / ")
                         )));

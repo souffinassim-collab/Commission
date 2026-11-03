@@ -27,9 +27,15 @@ sha2 = "0.10"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+# Mode développement (Lancer_Application.bat) : les bibliothèques de lecture PDF / Excel sont optimisées,
+# sinon la lecture d'un gros PDF prend plusieurs secondes
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# « unwind » : une erreur pendant la lecture d'un fichier est rattrapée au lieu de fermer l'application
+panic = "unwind"
 strip = true

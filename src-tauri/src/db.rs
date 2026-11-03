@@ -21,7 +21,7 @@ pub struct DatabaseManager {
 }
 
 /// Dernière version de schéma connue (à incrémenter à chaque nouvelle migration)
-const LATEST_SCHEMA_VERSION: i32 = 8;
+const LATEST_SCHEMA_VERSION: i32 = 9;
 
 pub const STATUTS_BORDEREAU: [&str; 3] = ["BROUILLON", "VALIDE", "REGLE"];
 
@@ -404,6 +404,26 @@ impl DatabaseManager {
             }
             tx.execute(
                 "INSERT INTO _migrations (version, name, applied_at) VALUES (8, 'client_libelle_bordereau', ?1)",
+                params![now()],
+            )
+            .map_err(db_err)?;
+            tx.commit().map_err(db_err)?;
+        }
+
+        // Migration V9: agence (point de vente) de rattachement de l'intermédiaire ; un AGA est sa propre agence
+        if current_version < 9 {
+            let tx = conn.transaction().map_err(db_err)?;
+            if !Self::column_exists(&tx, "intermediaires", "code_agence")? {
+                tx.execute("ALTER TABLE intermediaires ADD COLUMN code_agence TEXT NOT NULL DEFAULT '';", [])
+                    .map_err(db_err)?;
+            }
+            tx.execute(
+                "UPDATE intermediaires SET code_agence = code WHERE type_intermediaire = 'AGA' AND code_agence = ''",
+                [],
+            )
+            .map_err(db_err)?;
+            tx.execute(
+                "INSERT INTO _migrations (version, name, applied_at) VALUES (9, 'code_agence_intermediaire', ?1)",
                 params![now()],
             )
             .map_err(db_err)?;
@@ -891,6 +911,7 @@ impl DatabaseManager {
             adresse: row.get(7)?,
             tva_applicable: row.get(8)?,
             actif: actif_int != 0,
+            code_agence: row.get(10)?,
         })
     }
 
@@ -898,7 +919,8 @@ impl DatabaseManager {
         let conn = self.get_connection()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, type_intermediaire, code, nom, succursale, departement, contact, adresse, tva_applicable, actif
+                "SELECT id, type_intermediaire, code, nom, succursale, departement, contact, adresse, tva_applicable, actif,
+                        COALESCE(code_agence, '')
                  FROM intermediaires ORDER BY nom ASC",
             )
             .map_err(db_err)?;
@@ -909,7 +931,8 @@ impl DatabaseManager {
     pub fn get_intermediaire(&self, id: i64) -> DbResult<Option<Intermediaire>> {
         let conn = self.get_connection()?;
         conn.query_row(
-            "SELECT id, type_intermediaire, code, nom, succursale, departement, contact, adresse, tva_applicable, actif
+            "SELECT id, type_intermediaire, code, nom, succursale, departement, contact, adresse, tva_applicable, actif,
+                        COALESCE(code_agence, '')
              FROM intermediaires WHERE id = ?1",
             params![id],
             Self::map_intermediaire,
@@ -939,6 +962,14 @@ impl DatabaseManager {
         if !(0.0..=1.0).contains(&item.tva_applicable) {
             return Err("Le taux de TVA doit être compris entre 0 % et 100 %.".to_string());
         }
+        // Agence de rattachement : un AGA est sa propre agence si rien n'est saisi
+        let code_agence = match item.code_agence.trim() {
+            "" if item.type_intermediaire == "AGA" => code.clone(),
+            a => a.to_string(),
+        };
+        if code_agence.contains('/') || code_agence.contains(' ') {
+            return Err("Le code agence est le préfixe du N° de police, sans « / » ni espace (ex: 347).".to_string());
+        }
         let conn = self.get_connection()?;
         let doublon: Option<i64> = conn
             .query_row(
@@ -965,11 +996,11 @@ impl DatabaseManager {
             }
             conn.execute(
                 "UPDATE intermediaires SET type_intermediaire = ?1, code = ?2, nom = ?3, succursale = ?4, departement = ?5,
-                    contact = ?6, adresse = ?7, tva_applicable = ?8, actif = ?9
+                    contact = ?6, adresse = ?7, tva_applicable = ?8, actif = ?9, code_agence = ?11
                  WHERE id = ?10",
                 params![
                     item.type_intermediaire, code, nom, item.succursale.trim(), item.departement.trim(), item.contact,
-                    item.adresse, item.tva_applicable, if item.actif { 1 } else { 0 }, id
+                    item.adresse, item.tva_applicable, if item.actif { 1 } else { 0 }, id, code_agence
                 ],
             )
             .map_err(db_err)?;
@@ -977,11 +1008,11 @@ impl DatabaseManager {
         } else {
             conn.execute(
                 "INSERT INTO intermediaires
-                 (type_intermediaire, code, nom, succursale, departement, contact, adresse, tva_applicable, actif)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (type_intermediaire, code, nom, succursale, departement, contact, adresse, tva_applicable, actif, code_agence)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     item.type_intermediaire, code, nom, item.succursale.trim(), item.departement.trim(), item.contact,
-                    item.adresse, item.tva_applicable, if item.actif { 1 } else { 0 }
+                    item.adresse, item.tva_applicable, if item.actif { 1 } else { 0 }, code_agence
                 ],
             )
             .map_err(db_err)?;

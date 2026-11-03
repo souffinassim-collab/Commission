@@ -36,6 +36,7 @@ export const IntermediairesPage: React.FC = () => {
     adresse: '',
     tva_applicable: 0.19,
     actif: true,
+    code_agence: '',
   });
 
   useEffect(() => {
@@ -66,6 +67,7 @@ export const IntermediairesPage: React.FC = () => {
       adresse: '',
       tva_applicable: 0.19,
       actif: true,
+      code_agence: '',
     });
     setShowModal(true);
   };
@@ -177,6 +179,7 @@ export const IntermediairesPage: React.FC = () => {
                 </span>
                 <span className="font-mono text-xs font-bold text-slate-500 bg-slate-100 px-2 py-0.5 rounded">
                   Code : {item.code}
+                  {item.code_agence && item.code_agence !== item.code && <> · Agence {item.code_agence}</>}
                 </span>
               </div>
 
@@ -275,7 +278,7 @@ export const IntermediairesPage: React.FC = () => {
                 </div>
               </div>
 
-              <div className="grid grid-cols-3 gap-3">
+              <div className="grid grid-cols-4 gap-3">
                 <div className="col-span-1">
                   <label className="block font-semibold text-slate-700 mb-1">Code</label>
                   <input
@@ -285,6 +288,18 @@ export const IntermediairesPage: React.FC = () => {
                     onChange={(e) => setForm({ ...form, code: e.target.value })}
                     className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2 font-mono font-bold text-slate-900 focus:ring-2 focus:ring-indigo-500 focus:outline-hidden"
                     placeholder="ex: 492"
+                  />
+                </div>
+                <div className="col-span-1">
+                  <label className="block font-semibold text-slate-700 mb-1" title="Préfixe des N° de police (point de vente)">
+                    Code agence
+                  </label>
+                  <input
+                    type="text"
+                    value={form.code_agence || ''}
+                    onChange={(e) => setForm({ ...form, code_agence: e.target.value.replace(/[\s/]/g, '') })}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2 font-mono font-bold text-slate-900 focus:ring-2 focus:ring-indigo-500 focus:outline-hidden"
+                    placeholder={form.type_intermediaire === 'AGA' ? form.code || 'ex: 492' : 'ex: 347'}
                   />
                 </div>
                 <div className="col-span-2">
