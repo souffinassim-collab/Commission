@@ -1,13 +1,13 @@
+use crate::calculation::alias_list;
+use crate::models::{
+    Anomalie, Bordereau, BordereauLigne, BrancheParam, Categorie, DbInfo, FichierBordereau,
+    Intermediaire, UploadedFileResult,
+};
+use chrono::Local;
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use chrono::Local;
-use rusqlite::{params, Connection, OptionalExtension};
-use crate::calculation::alias_list;
-use crate::models::{
-    Anomalie, Bordereau, BordereauLigne, BrancheParam, Categorie, DbInfo, FichierBordereau, Intermediaire,
-    UploadedFileResult,
-};
 
 /// Résultat des opérations BDD : les erreurs sont des messages lisibles par l'utilisateur
 pub type DbResult<T> = std::result::Result<T, String>;
@@ -28,13 +28,19 @@ pub const STATUTS_BORDEREAU: [&str; 3] = ["BROUILLON", "VALIDE", "REGLE"];
 /// Catégories proposées à l'origine et règle de classement initial (premier segment du code ministériel)
 const CATEGORIES_INITIALES: [(&str, &str); 5] = [
     ("Automobile", "code LIKE '3.%'"),
-    ("Transport & Maritime", "code LIKE '4.%' OR code LIKE '5.%' OR code LIKE '6.%' OR code LIKE '7.%'"),
+    (
+        "Transport & Maritime",
+        "code LIKE '4.%' OR code LIKE '5.%' OR code LIKE '6.%' OR code LIKE '7.%'",
+    ),
     ("Agricole", "LOWER(branche) LIKE '%agricole%'"),
     (
         "Incendie & Risques Divers",
         "code LIKE '2.%' OR code LIKE '8.%' OR code LIKE '9.%' OR code LIKE '16.%' OR code = '16'",
     ),
-    ("Responsabilité Civile", "code LIKE '10.%' OR code LIKE '11.%' OR code LIKE '12.%' OR code LIKE '13.%'"),
+    (
+        "Responsabilité Civile",
+        "code LIKE '10.%' OR code LIKE '11.%' OR code LIKE '12.%' OR code LIKE '13.%'",
+    ),
 ];
 
 /// Fichier d'import à rattacher à un bordereau lors de l'enregistrement
@@ -48,7 +54,9 @@ impl DatabaseManager {
     pub fn new() -> DbResult<Self> {
         let bdd_dir = Self::get_bdd_directory();
         fs::create_dir_all(bdd_dir.join("backups")).unwrap_or_default();
-        let manager = Self { db_path: bdd_dir.join("commissions.db") };
+        let manager = Self {
+            db_path: bdd_dir.join("commissions.db"),
+        };
         manager.run_migrations()?;
         Ok(manager)
     }
@@ -86,8 +94,11 @@ impl DatabaseManager {
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(exe_dir) = exe_path.parent() {
                 let exe_str = exe_dir.to_string_lossy().to_lowercase();
-                if exe_str.contains("target\\debug") || exe_str.contains("target/debug")
-                    || exe_str.contains("target\\release") || exe_str.contains("target/release") {
+                if exe_str.contains("target\\debug")
+                    || exe_str.contains("target/debug")
+                    || exe_str.contains("target\\release")
+                    || exe_str.contains("target/release")
+                {
                     let mut cur = exe_dir.to_path_buf();
                     while let Some(parent) = cur.parent() {
                         if cur.file_name().and_then(|n| n.to_str()) == Some("src-tauri") {
@@ -132,7 +143,11 @@ impl DatabaseManager {
         .map_err(db_err)?;
 
         let current_version: i32 = conn
-            .query_row("SELECT COALESCE(MAX(version), 0) FROM _migrations", [], |row| row.get(0))
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM _migrations",
+                [],
+                |row| row.get(0),
+            )
             .unwrap_or(0);
 
         // Sauvegarde automatique pré-migration uniquement si une migration va réellement s'appliquer
@@ -225,8 +240,11 @@ impl DatabaseManager {
         if current_version < 2 {
             let tx = conn.transaction().map_err(db_err)?;
             if !Self::column_exists(&tx, "bordereau_lignes", "desactive")? {
-                tx.execute("ALTER TABLE bordereau_lignes ADD COLUMN desactive INTEGER NOT NULL DEFAULT 0;", [])
-                    .map_err(db_err)?;
+                tx.execute(
+                    "ALTER TABLE bordereau_lignes ADD COLUMN desactive INTEGER NOT NULL DEFAULT 0;",
+                    [],
+                )
+                .map_err(db_err)?;
             }
             tx.execute(
                 "INSERT INTO _migrations (version, name, applied_at) VALUES (2, 'add_desactive_column', ?1)",
@@ -249,8 +267,11 @@ impl DatabaseManager {
                 .map_err(db_err)?;
             }
             if !Self::column_exists(&tx, "bordereau_lignes", "contributions_json")? {
-                tx.execute("ALTER TABLE bordereau_lignes ADD COLUMN contributions_json TEXT;", [])
-                    .map_err(db_err)?;
+                tx.execute(
+                    "ALTER TABLE bordereau_lignes ADD COLUMN contributions_json TEXT;",
+                    [],
+                )
+                .map_err(db_err)?;
             }
             tx.execute(
                 "INSERT INTO _migrations (version, name, applied_at) VALUES (3, 'add_lignes_contributions_non_parametre', ?1)",
@@ -265,16 +286,26 @@ impl DatabaseManager {
         if current_version < 4 {
             let tx = conn.transaction().map_err(db_err)?;
             for (col, ddl) in [
-                ("alias_import", "ALTER TABLE branches ADD COLUMN alias_import TEXT NOT NULL DEFAULT '';"),
-                ("groupe_bordereau", "ALTER TABLE branches ADD COLUMN groupe_bordereau TEXT NOT NULL DEFAULT '';"),
-                ("ordre_bordereau", "ALTER TABLE branches ADD COLUMN ordre_bordereau INTEGER NOT NULL DEFAULT 999;"),
+                (
+                    "alias_import",
+                    "ALTER TABLE branches ADD COLUMN alias_import TEXT NOT NULL DEFAULT '';",
+                ),
+                (
+                    "groupe_bordereau",
+                    "ALTER TABLE branches ADD COLUMN groupe_bordereau TEXT NOT NULL DEFAULT '';",
+                ),
+                (
+                    "ordre_bordereau",
+                    "ALTER TABLE branches ADD COLUMN ordre_bordereau INTEGER NOT NULL DEFAULT 999;",
+                ),
             ] {
                 if !Self::column_exists(&tx, "branches", col)? {
                     tx.execute(ddl, []).map_err(db_err)?;
                 }
             }
             if !Self::column_exists(&tx, "bordereaux", "anomalies_json")? {
-                tx.execute("ALTER TABLE bordereaux ADD COLUMN anomalies_json TEXT;", []).map_err(db_err)?;
+                tx.execute("ALTER TABLE bordereaux ADD COLUMN anomalies_json TEXT;", [])
+                    .map_err(db_err)?;
             }
             tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS bordereau_fichiers (
@@ -338,7 +369,11 @@ impl DatabaseManager {
                 .map_err(db_err)?;
             }
             if !Self::column_exists(&tx, "bordereau_fichiers", "selection")? {
-                tx.execute("ALTER TABLE bordereau_fichiers ADD COLUMN selection TEXT;", []).map_err(db_err)?;
+                tx.execute(
+                    "ALTER TABLE bordereau_fichiers ADD COLUMN selection TEXT;",
+                    [],
+                )
+                .map_err(db_err)?;
             }
             tx.execute(
                 "INSERT INTO _migrations (version, name, applied_at) VALUES (5, 'contenu_fichiers_mutualise_selection', ?1)",
@@ -352,7 +387,8 @@ impl DatabaseManager {
         if current_version < 6 {
             let tx = conn.transaction().map_err(db_err)?;
             if !Self::column_exists(&tx, "bordereaux", "facture_json")? {
-                tx.execute("ALTER TABLE bordereaux ADD COLUMN facture_json TEXT;", []).map_err(db_err)?;
+                tx.execute("ALTER TABLE bordereaux ADD COLUMN facture_json TEXT;", [])
+                    .map_err(db_err)?;
             }
             tx.execute(
                 "INSERT INTO _migrations (version, name, applied_at) VALUES (6, 'facture_intermediaire', ?1)",
@@ -380,11 +416,16 @@ impl DatabaseManager {
                 )
                 .map_err(db_err)?;
             }
-            let nb: i64 = tx.query_row("SELECT COUNT(*) FROM categories", [], |r| r.get(0)).map_err(db_err)?;
+            let nb: i64 = tx
+                .query_row("SELECT COUNT(*) FROM categories", [], |r| r.get(0))
+                .map_err(db_err)?;
             if nb == 0 {
                 for (i, lib) in CATEGORIES_INITIALES.iter().enumerate() {
-                    tx.execute("INSERT INTO categories (libelle, ordre) VALUES (?1, ?2)", params![lib.0, (i as i32 + 1) * 10])
-                        .map_err(db_err)?;
+                    tx.execute(
+                        "INSERT INTO categories (libelle, ordre) VALUES (?1, ?2)",
+                        params![lib.0, (i as i32 + 1) * 10],
+                    )
+                    .map_err(db_err)?;
                 }
             }
             Self::apply_default_categories(&tx)?;
@@ -400,7 +441,8 @@ impl DatabaseManager {
         if current_version < 8 {
             let tx = conn.transaction().map_err(db_err)?;
             if !Self::column_exists(&tx, "bordereaux", "client_libelle")? {
-                tx.execute("ALTER TABLE bordereaux ADD COLUMN client_libelle TEXT;", []).map_err(db_err)?;
+                tx.execute("ALTER TABLE bordereaux ADD COLUMN client_libelle TEXT;", [])
+                    .map_err(db_err)?;
             }
             tx.execute(
                 "INSERT INTO _migrations (version, name, applied_at) VALUES (8, 'client_libelle_bordereau', ?1)",
@@ -414,8 +456,11 @@ impl DatabaseManager {
         if current_version < 9 {
             let tx = conn.transaction().map_err(db_err)?;
             if !Self::column_exists(&tx, "intermediaires", "code_agence")? {
-                tx.execute("ALTER TABLE intermediaires ADD COLUMN code_agence TEXT NOT NULL DEFAULT '';", [])
-                    .map_err(db_err)?;
+                tx.execute(
+                    "ALTER TABLE intermediaires ADD COLUMN code_agence TEXT NOT NULL DEFAULT '';",
+                    [],
+                )
+                .map_err(db_err)?;
             }
             tx.execute(
                 "UPDATE intermediaires SET code_agence = code WHERE type_intermediaire = 'AGA' AND code_agence = ''",
@@ -438,7 +483,11 @@ impl DatabaseManager {
     fn apply_default_categories(conn: &Connection) -> DbResult<()> {
         for (libelle, condition) in CATEGORIES_INITIALES.iter() {
             let id: Option<i64> = conn
-                .query_row("SELECT id FROM categories WHERE libelle = ?1", params![libelle], |r| r.get(0))
+                .query_row(
+                    "SELECT id FROM categories WHERE libelle = ?1",
+                    params![libelle],
+                    |r| r.get(0),
+                )
                 .optional()
                 .map_err(db_err)?;
             if let Some(id) = id {
@@ -457,10 +506,16 @@ impl DatabaseManager {
 
     fn insert_default_rates(conn: &Connection) -> DbResult<()> {
         let json = include_str!("../../initial_rates.json");
-        let rates: Vec<serde_json::Value> =
-            serde_json::from_str(json).map_err(|e| format!("initial_rates.json invalide : {}", e))?;
+        let rates: Vec<serde_json::Value> = serde_json::from_str(json)
+            .map_err(|e| format!("initial_rates.json invalide : {}", e))?;
         for item in rates {
-            let s = |k: &str| item.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let s = |k: &str| {
+                item.get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
             let f = |k: &str| item.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
             conn.execute(
                 "INSERT INTO branches (code, branche, sous_code, sous_libelle, taux_apport_courtier, taux_apport_aga, taux_gestion_aga)
@@ -496,7 +551,13 @@ impl DatabaseManager {
         let groupes_par_sous_code: [(&[&str], &str, i32); 5] = [
             (&["VRC", "VRCR", "VRCE"], "RC AUTOMOBILE", 10),
             (&["VASS"], "ASSISTANCE AUTOMOBILE", 20),
-            (&["VTR", "VOLV", "VINV", "VDR", "VBDG", "VPT", "VVA", "VDC", "VVI"], "AUTOMOBILE FACULTATIF", 30),
+            (
+                &[
+                    "VTR", "VOLV", "VINV", "VDR", "VBDG", "VPT", "VVA", "VDC", "VVI",
+                ],
+                "AUTOMOBILE FACULTATIF",
+                30,
+            ),
             (&["CANAT"], "CATNAT", 40),
             (&["RVAC", "RVTR"], "RC. Du Transporteur", 150),
         ];
@@ -553,8 +614,12 @@ impl DatabaseManager {
             ("VF", "S:VTR"),
         ];
         let existing: Vec<String> = {
-            let mut st = conn.prepare("SELECT alias_import FROM branches").map_err(db_err)?;
-            let rows = st.query_map([], |r| r.get::<_, String>(0)).map_err(db_err)?;
+            let mut st = conn
+                .prepare("SELECT alias_import FROM branches")
+                .map_err(db_err)?;
+            let rows = st
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(db_err)?;
             let mut v = Vec::new();
             for r in rows {
                 for a in r.map_err(db_err)?.split(',') {
@@ -567,7 +632,10 @@ impl DatabaseManager {
             v
         };
         for (aliases, cible) in alias {
-            if aliases.split(',').any(|a| existing.contains(&a.to_string())) {
+            if aliases
+                .split(',')
+                .any(|a| existing.contains(&a.to_string()))
+            {
                 continue;
             }
             let (col, val) = cible.split_at(2);
@@ -576,18 +644,28 @@ impl DatabaseManager {
             } else {
                 "SELECT id FROM branches WHERE code = ?1 AND alias_import = '' ORDER BY id LIMIT 1"
             };
-            let id: Option<i64> = conn.query_row(sql, params![val], |r| r.get(0)).optional().map_err(db_err)?;
+            let id: Option<i64> = conn
+                .query_row(sql, params![val], |r| r.get(0))
+                .optional()
+                .map_err(db_err)?;
             if let Some(id) = id {
-                conn.execute("UPDATE branches SET alias_import = ?1 WHERE id = ?2", params![aliases, id])
-                    .map_err(db_err)?;
+                conn.execute(
+                    "UPDATE branches SET alias_import = ?1 WHERE id = ?2",
+                    params![aliases, id],
+                )
+                .map_err(db_err)?;
             }
         }
         Ok(())
     }
 
     fn column_exists(conn: &Connection, table: &str, column: &str) -> DbResult<bool> {
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table)).map_err(db_err)?;
-        let names = stmt.query_map([], |row| row.get::<_, String>(1)).map_err(db_err)?;
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({})", table))
+            .map_err(db_err)?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(db_err)?;
         for n in names {
             if n.map_err(db_err)? == column {
                 return Ok(true);
@@ -611,13 +689,20 @@ impl DatabaseManager {
             return Ok(PathBuf::new());
         }
         let now = Local::now().format("%Y%m%d_%H%M%S").to_string();
-        let backup_dir = self.db_path.parent().unwrap_or(Path::new(".")).join("backups");
+        let backup_dir = self
+            .db_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("backups");
         fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
         let backup_path = backup_dir.join(format!("backup_commissions_{}.db", now));
         // VACUUM INTO produit une copie cohérente même en mode WAL
         let conn = Connection::open(&self.db_path).map_err(db_err)?;
         let target = backup_path.to_string_lossy().replace('\'', "''");
-        if conn.execute_batch(&format!("VACUUM INTO '{}'", target)).is_err() {
+        if conn
+            .execute_batch(&format!("VACUUM INTO '{}'", target))
+            .is_err()
+        {
             fs::copy(&self.db_path, &backup_path).map_err(|e| e.to_string())?;
         }
         Ok(backup_path)
@@ -625,13 +710,20 @@ impl DatabaseManager {
 
     pub fn get_info(&self) -> DbResult<DbInfo> {
         let conn = self.get_connection()?;
-        let count = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap_or(0);
+        let count = |sql: &str| {
+            conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap_or(0)
+        };
         let version = count("SELECT COALESCE(MAX(version), 0) FROM _migrations") as i32;
         let total_branches = count("SELECT COUNT(*) FROM branches");
         let total_intermediaires = count("SELECT COUNT(*) FROM intermediaires");
         let total_bordereaux = count("SELECT COUNT(*) FROM bordereaux");
 
-        let backups_dir = self.db_path.parent().unwrap_or(Path::new(".")).join("backups");
+        let backups_dir = self
+            .db_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("backups");
         let mut last_backup = None;
         if let Ok(entries) = fs::read_dir(backups_dir) {
             let mut latest_time = None;
@@ -691,12 +783,20 @@ impl DatabaseManager {
 
     /// Sous-codes paramétrés (servent au découpage des codes garanties des rapports importés)
     pub fn known_sous_codes(&self) -> DbResult<Vec<String>> {
-        Ok(self
-            .get_all_branches()?
-            .into_iter()
-            .map(|b| b.sous_code.trim().to_uppercase())
-            .filter(|s| !s.is_empty())
-            .collect())
+        let mut codes = Vec::new();
+        for b in self.get_all_branches()? {
+            let sc = b.sous_code.trim().to_uppercase();
+            if !sc.is_empty() && !codes.contains(&sc) {
+                codes.push(sc);
+            }
+            for a in b.alias_import.split(|c| c == ',' || c == ';') {
+                let a = a.trim().to_uppercase();
+                if !a.is_empty() && !codes.contains(&a) {
+                    codes.push(a);
+                }
+            }
+        }
+        Ok(codes)
     }
 
     fn validate_branche(&self, b: &BrancheParam) -> DbResult<BrancheParam> {
@@ -718,13 +818,20 @@ impl DatabaseManager {
             ("gestion AGA", clean.taux_gestion_aga),
         ] {
             if !(0.0..=1.0).contains(&t) || t.is_nan() {
-                return Err(format!("Taux {} invalide ({}) : il doit être compris entre 0 % et 100 %.", nom, t));
+                return Err(format!(
+                    "Taux {} invalide ({}) : il doit être compris entre 0 % et 100 %.",
+                    nom, t
+                ));
             }
         }
         if let Some(cid) = clean.categorie_id {
             let conn = self.get_connection()?;
             let existe: Option<i64> = conn
-                .query_row("SELECT id FROM categories WHERE id = ?1", params![cid], |r| r.get(0))
+                .query_row(
+                    "SELECT id FROM categories WHERE id = ?1",
+                    params![cid],
+                    |r| r.get(0),
+                )
                 .optional()
                 .map_err(db_err)?;
             if existe.is_none() {
@@ -737,10 +844,9 @@ impl DatabaseManager {
             .filter(|o| o.id != b.id || b.id.is_none())
             .collect();
         if !clean.sous_code.is_empty() {
-            if let Some(o) = others
-                .iter()
-                .find(|o| o.sous_code.trim().to_uppercase() == clean.sous_code && o.code.trim() == clean.code)
-            {
+            if let Some(o) = others.iter().find(|o| {
+                o.sous_code.trim().to_uppercase() == clean.sous_code && o.code.trim() == clean.code
+            }) {
                 return Err(format!(
                     "Le sous-code « {} » existe déjà pour la branche {} ({}).",
                     clean.sous_code, clean.code, o.branche
@@ -775,7 +881,10 @@ impl DatabaseManager {
                 )
                 .map_err(db_err)?;
             if n == 0 {
-                return Err(format!("Paramètre #{} introuvable (supprimé entre-temps ?).", id));
+                return Err(format!(
+                    "Paramètre #{} introuvable (supprimé entre-temps ?).",
+                    id
+                ));
             }
             return Ok(id);
         }
@@ -796,9 +905,14 @@ impl DatabaseManager {
     pub fn delete_branche(&self, id: i64) -> DbResult<()> {
         let mut conn = self.get_connection()?;
         let tx = conn.transaction().map_err(db_err)?;
-        tx.execute("UPDATE bordereau_lignes SET branche_id = NULL WHERE branche_id = ?1", params![id])
+        tx.execute(
+            "UPDATE bordereau_lignes SET branche_id = NULL WHERE branche_id = ?1",
+            params![id],
+        )
+        .map_err(db_err)?;
+        let n = tx
+            .execute("DELETE FROM branches WHERE id = ?1", params![id])
             .map_err(db_err)?;
-        let n = tx.execute("DELETE FROM branches WHERE id = ?1", params![id]).map_err(db_err)?;
         if n == 0 {
             return Err(format!("Paramètre #{} introuvable.", id));
         }
@@ -808,7 +922,8 @@ impl DatabaseManager {
     pub fn reset_branches_to_default(&self) -> DbResult<()> {
         let mut conn = self.get_connection()?;
         let tx = conn.transaction().map_err(db_err)?;
-        tx.execute("UPDATE bordereau_lignes SET branche_id = NULL", []).map_err(db_err)?;
+        tx.execute("UPDATE bordereau_lignes SET branche_id = NULL", [])
+            .map_err(db_err)?;
         tx.execute("DELETE FROM branches", []).map_err(db_err)?;
         Self::insert_default_rates(&tx)?;
         Self::fix_default_labels(&tx)?;
@@ -830,7 +945,14 @@ impl DatabaseManager {
             )
             .map_err(db_err)?;
         let rows = st
-            .query_map([], |r| Ok(Categorie { id: Some(r.get(0)?), libelle: r.get(1)?, ordre: r.get(2)?, nb_branches: r.get(3)? }))
+            .query_map([], |r| {
+                Ok(Categorie {
+                    id: Some(r.get(0)?),
+                    libelle: r.get(1)?,
+                    ordre: r.get(2)?,
+                    nb_branches: r.get(3)?,
+                })
+            })
             .map_err(db_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
     }
@@ -855,7 +977,10 @@ impl DatabaseManager {
         match c.id {
             Some(id) => {
                 let n = conn
-                    .execute("UPDATE categories SET libelle = ?1, ordre = ?2 WHERE id = ?3", params![libelle, c.ordre, id])
+                    .execute(
+                        "UPDATE categories SET libelle = ?1, ordre = ?2 WHERE id = ?3",
+                        params![libelle, c.ordre, id],
+                    )
                     .map_err(db_err)?;
                 if n == 0 {
                     return Err(format!("Catégorie #{} introuvable.", id));
@@ -863,8 +988,11 @@ impl DatabaseManager {
                 Ok(id)
             }
             None => {
-                conn.execute("INSERT INTO categories (libelle, ordre) VALUES (?1, ?2)", params![libelle, c.ordre])
-                    .map_err(db_err)?;
+                conn.execute(
+                    "INSERT INTO categories (libelle, ordre) VALUES (?1, ?2)",
+                    params![libelle, c.ordre],
+                )
+                .map_err(db_err)?;
                 Ok(conn.last_insert_rowid())
             }
         }
@@ -874,9 +1002,14 @@ impl DatabaseManager {
     pub fn delete_categorie(&self, id: i64) -> DbResult<()> {
         let mut conn = self.get_connection()?;
         let tx = conn.transaction().map_err(db_err)?;
-        tx.execute("UPDATE branches SET categorie_id = NULL WHERE categorie_id = ?1", params![id])
+        tx.execute(
+            "UPDATE branches SET categorie_id = NULL WHERE categorie_id = ?1",
+            params![id],
+        )
+        .map_err(db_err)?;
+        let n = tx
+            .execute("DELETE FROM categories WHERE id = ?1", params![id])
             .map_err(db_err)?;
-        let n = tx.execute("DELETE FROM categories WHERE id = ?1", params![id]).map_err(db_err)?;
         if n == 0 {
             return Err(format!("Catégorie #{} introuvable.", id));
         }
@@ -884,12 +1017,19 @@ impl DatabaseManager {
     }
 
     /// Range plusieurs lignes de paramètres dans une catégorie (aucune = « Sans catégorie »)
-    pub fn affecter_categorie(&self, branche_ids: &[i64], categorie_id: Option<i64>) -> DbResult<()> {
+    pub fn affecter_categorie(
+        &self,
+        branche_ids: &[i64],
+        categorie_id: Option<i64>,
+    ) -> DbResult<()> {
         let mut conn = self.get_connection()?;
         let tx = conn.transaction().map_err(db_err)?;
         for id in branche_ids {
-            tx.execute("UPDATE branches SET categorie_id = ?1 WHERE id = ?2", params![categorie_id, id])
-                .map_err(db_err)?;
+            tx.execute(
+                "UPDATE branches SET categorie_id = ?1 WHERE id = ?2",
+                params![categorie_id, id],
+            )
+            .map_err(db_err)?;
         }
         tx.commit().map_err(db_err)
     }
@@ -924,7 +1064,9 @@ impl DatabaseManager {
                  FROM intermediaires ORDER BY nom ASC",
             )
             .map_err(db_err)?;
-        let rows = stmt.query_map([], Self::map_intermediaire).map_err(db_err)?;
+        let rows = stmt
+            .query_map([], Self::map_intermediaire)
+            .map_err(db_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
     }
 
@@ -968,7 +1110,10 @@ impl DatabaseManager {
             a => a.to_string(),
         };
         if code_agence.contains('/') || code_agence.contains(' ') {
-            return Err("Le code agence est le préfixe du N° de police, sans « / » ni espace (ex: 347).".to_string());
+            return Err(
+                "Le code agence est le préfixe du N° de police, sans « / » ni espace (ex: 347)."
+                    .to_string(),
+            );
         }
         let conn = self.get_connection()?;
         let doublon: Option<i64> = conn
@@ -980,7 +1125,10 @@ impl DatabaseManager {
             .optional()
             .map_err(db_err)?;
         if doublon.is_some() {
-            return Err(format!("Le code intermédiaire « {} » est déjà utilisé.", code));
+            return Err(format!(
+                "Le code intermédiaire « {} » est déjà utilisé.",
+                code
+            ));
         }
 
         if let Some(id) = item.id {
@@ -988,7 +1136,9 @@ impl DatabaseManager {
                 .get_intermediaire(id)?
                 .ok_or_else(|| format!("Intermédiaire #{} introuvable.", id))?;
             let nb = Self::count_bordereaux_intermediaire(&conn, id)?;
-            if nb > 0 && (before.code != code || before.type_intermediaire != item.type_intermediaire) {
+            if nb > 0
+                && (before.code != code || before.type_intermediaire != item.type_intermediaire)
+            {
                 return Err(format!(
                     "Impossible de modifier le code ou le type : {} bordereau(x) sont rattachés à cet intermédiaire.",
                     nb
@@ -1029,7 +1179,9 @@ impl DatabaseManager {
                 nb
             ));
         }
-        let n = conn.execute("DELETE FROM intermediaires WHERE id = ?1", params![id]).map_err(db_err)?;
+        let n = conn
+            .execute("DELETE FROM intermediaires WHERE id = ?1", params![id])
+            .map_err(db_err)?;
         if n == 0 {
             return Err(format!("Intermédiaire #{} introuvable.", id));
         }
@@ -1041,7 +1193,11 @@ impl DatabaseManager {
     // -----------------------------------------------------------------------------------------
 
     /// Bordereau déjà enregistré qui contient un fichier de même empreinte (autre que `exclude`)
-    pub fn find_hash_usage(&self, hash: &str, exclude: Option<i64>) -> DbResult<Option<(i64, String)>> {
+    pub fn find_hash_usage(
+        &self,
+        hash: &str,
+        exclude: Option<i64>,
+    ) -> DbResult<Option<(i64, String)>> {
         if hash.is_empty() {
             return Ok(None);
         }
@@ -1058,12 +1214,18 @@ impl DatabaseManager {
 
     /// Polices déjà commissionnées dans les autres bordereaux (lignes actives, polices non exclues) :
     /// N° de police normalisé -> numéro du bordereau
-    pub fn polices_commissionnees(&self, exclude: Option<i64>) -> DbResult<HashMap<String, String>> {
+    pub fn polices_commissionnees(
+        &self,
+        exclude: Option<i64>,
+    ) -> DbResult<HashMap<String, String>> {
         let conn = self.get_connection()?;
         Self::polices_commissionnees_conn(&conn, exclude)
     }
 
-    fn polices_commissionnees_conn(conn: &Connection, exclude: Option<i64>) -> DbResult<HashMap<String, String>> {
+    fn polices_commissionnees_conn(
+        conn: &Connection,
+        exclude: Option<i64>,
+    ) -> DbResult<HashMap<String, String>> {
         let mut st = conn
             .prepare(
                 "SELECT b.numero_bordereau, l.contributions_json, b.facture_json FROM bordereau_lignes l
@@ -1073,20 +1235,31 @@ impl DatabaseManager {
             .map_err(db_err)?;
         let rows = st
             .query_map(params![exclude], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
             })
             .map_err(db_err)?;
         let mut map = HashMap::new();
         for row in rows {
             let (bordereau, json, facture_json) = row.map_err(db_err)?;
             // Libellé de l'origine : bordereau et, si saisie, facture de l'intermédiaire
-            let facture: Option<crate::models::FactureIntermediaire> = facture_json.and_then(|j| serde_json::from_str(&j).ok());
+            let facture: Option<crate::models::FactureIntermediaire> =
+                facture_json.and_then(|j| serde_json::from_str(&j).ok());
             let numero = match facture.filter(|f| !f.numero.trim().is_empty()) {
-                Some(f) if !f.date.trim().is_empty() => format!("bordereau {} — facture N° {} du {}", bordereau, f.numero.trim(), f.date.trim()),
+                Some(f) if !f.date.trim().is_empty() => format!(
+                    "bordereau {} — facture N° {} du {}",
+                    bordereau,
+                    f.numero.trim(),
+                    f.date.trim()
+                ),
                 Some(f) => format!("bordereau {} — facture N° {}", bordereau, f.numero.trim()),
                 None => format!("bordereau {}", bordereau),
             };
-            let contributions: Vec<crate::models::LigneContribution> = serde_json::from_str(&json).unwrap_or_default();
+            let contributions: Vec<crate::models::LigneContribution> =
+                serde_json::from_str(&json).unwrap_or_default();
             for c in contributions.into_iter().filter(|c| !c.exclue) {
                 if let Some(p) = c.police {
                     let key = normaliser_police(&p);
@@ -1102,16 +1275,20 @@ impl DatabaseManager {
     /// Enregistre (création ou mise à jour) un bordereau avec ses lignes et, si fournis, ses fichiers d'import.
     /// Contrôles : intermédiaire existant et cohérent, bordereau modifiable (BROUILLON), aucune ligne active
     /// non paramétrée, aucun fichier en anomalie bloquante ni déjà utilisé par un autre bordereau.
-    pub fn save_bordereau(&self, b: &Bordereau, imports: Option<&[ImportAEnregistrer]>) -> DbResult<i64> {
+    pub fn save_bordereau(
+        &self,
+        b: &Bordereau,
+        imports: Option<&[ImportAEnregistrer]>,
+    ) -> DbResult<i64> {
         if b.lignes.is_empty() {
             return Err("Le bordereau ne contient aucune ligne.".to_string());
         }
         if !STATUTS_BORDEREAU.contains(&b.statut.as_str()) {
             return Err(format!("Statut de bordereau invalide : {}", b.statut));
         }
-        let inter_id = b
-            .intermediaire_id
-            .ok_or_else(|| "Le bordereau doit être rattaché à un intermédiaire enregistré.".to_string())?;
+        let inter_id = b.intermediaire_id.ok_or_else(|| {
+            "Le bordereau doit être rattaché à un intermédiaire enregistré.".to_string()
+        })?;
         let inter = self
             .get_intermediaire(inter_id)?
             .ok_or_else(|| format!("Intermédiaire #{} introuvable.", inter_id))?;
@@ -1121,7 +1298,11 @@ impl DatabaseManager {
                 b.type_intermediaire, b.intermediaire_code, inter.type_intermediaire, inter.code
             ));
         }
-        let np: Vec<&BordereauLigne> = b.lignes.iter().filter(|l| l.non_parametre && l.est_active()).collect();
+        let np: Vec<&BordereauLigne> = b
+            .lignes
+            .iter()
+            .filter(|l| l.non_parametre && l.est_active())
+            .collect();
         if !np.is_empty() {
             return Err(format!(
                 "Enregistrement impossible : {} ligne(s) sans taux paramétré ({}). Paramétrez-les ou excluez-les du bordereau.",
@@ -1135,7 +1316,11 @@ impl DatabaseManager {
 
         let existing: Option<(i64, String)> = match b.id {
             Some(id) => tx
-                .query_row("SELECT id, statut FROM bordereaux WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_row(
+                    "SELECT id, statut FROM bordereaux WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
                 .optional()
                 .map_err(db_err)?,
             None => None,
@@ -1153,8 +1338,16 @@ impl DatabaseManager {
         if let Some(imports) = imports {
             for imp in imports {
                 let f = imp.fichier;
-                if let Some(a) = f.anomalies.iter().chain(f.anomalies_contexte.iter()).find(|a| a.est_bloquante()) {
-                    return Err(format!("Le fichier « {} » présente une anomalie bloquante : {}", f.file_name, a.message));
+                if let Some(a) = f
+                    .anomalies
+                    .iter()
+                    .chain(f.anomalies_contexte.iter())
+                    .find(|a| a.est_bloquante())
+                {
+                    return Err(format!(
+                        "Le fichier « {} » présente une anomalie bloquante : {}",
+                        f.file_name, a.message
+                    ));
                 }
                 // Rapport CIRIS : totaux sans N° de police, le contrôle se fait sur le fichier lui-même
                 if f.file_type == "CIRIS_PDF" && !f.hash.is_empty() {
@@ -1182,9 +1375,17 @@ impl DatabaseManager {
         let mut doublons: Vec<String> = Vec::new();
         for l in b.lignes.iter().filter(|l| !l.desactive) {
             for c in l.contributions.iter().filter(|c| !c.exclue) {
-                if let Some(num) = c.police.as_deref().and_then(|p| deja.get(&normaliser_police(p))) {
+                if let Some(num) = c
+                    .police
+                    .as_deref()
+                    .and_then(|p| deja.get(&normaliser_police(p)))
+                {
                     // Double facturation : une police déjà facturée ne peut pas être refacturée
-                    doublons.push(format!("{} ({})", c.police.clone().unwrap_or_default(), num));
+                    doublons.push(format!(
+                        "{} ({})",
+                        c.police.clone().unwrap_or_default(),
+                        num
+                    ));
                 }
             }
         }
@@ -1201,7 +1402,10 @@ impl DatabaseManager {
 
         // Numéro de bordereau unique : suffixe -2, -3... s'il est déjà pris par un autre bordereau
         let base_numero = if b.numero_bordereau.trim().is_empty() {
-            format!("BORD-{}-{}-{}", b.type_intermediaire, b.intermediaire_code, b.exercice)
+            format!(
+                "BORD-{}-{}-{}",
+                b.type_intermediaire, b.intermediaire_code, b.exercice
+            )
         } else {
             b.numero_bordereau.trim().to_string()
         };
@@ -1221,16 +1425,27 @@ impl DatabaseManager {
             suffix += 1;
         }
 
-        let anomalies_json = if b.anomalies.is_empty() { None } else { serde_json::to_string(&b.anomalies).ok() };
-        let facture_json = b.facture.as_ref().and_then(|f| serde_json::to_string(f).ok());
+        let anomalies_json = if b.anomalies.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&b.anomalies).ok()
+        };
+        let facture_json = b
+            .facture
+            .as_ref()
+            .and_then(|f| serde_json::to_string(f).ok());
         if let Some(f) = &b.facture {
             if !crate::models::date_valide(&f.date) {
-                return Err(format!("Date de facture invalide « {} » : format attendu JJ/MM/AAAA.", f.date));
+                return Err(format!(
+                    "Date de facture invalide « {} » : format attendu JJ/MM/AAAA.",
+                    f.date
+                ));
             }
         }
         // Client(s) recalculé(s) à partir des polices réellement comptées (exclusions comprises)
-        let client_libelle = crate::calculation::CalculationEngine::libelle_clients_lignes(&b.lignes)
-            .or_else(|| b.client_libelle.clone().filter(|s| !s.trim().is_empty()));
+        let client_libelle =
+            crate::calculation::CalculationEngine::libelle_clients_lignes(&b.lignes)
+                .or_else(|| b.client_libelle.clone().filter(|s| !s.trim().is_empty()));
 
         let bordereau_id: i64 = if let Some(id) = existing_id {
             tx.execute(
@@ -1249,7 +1464,11 @@ impl DatabaseManager {
                 ],
             )
             .map_err(db_err)?;
-            tx.execute("DELETE FROM bordereau_lignes WHERE bordereau_id = ?1", params![id]).map_err(db_err)?;
+            tx.execute(
+                "DELETE FROM bordereau_lignes WHERE bordereau_id = ?1",
+                params![id],
+            )
+            .map_err(db_err)?;
             id
         } else {
             tx.execute(
@@ -1271,12 +1490,17 @@ impl DatabaseManager {
         };
 
         for l in &b.lignes {
-            let contributions_json =
-                if l.contributions.is_empty() { None } else { serde_json::to_string(&l.contributions).ok() };
+            let contributions_json = if l.contributions.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&l.contributions).ok()
+            };
             // La ligne ne référence une branche que si celle-ci existe encore (évite l'échec de clé étrangère)
             let branche_id: Option<i64> = match l.branche_id {
                 Some(bid) => tx
-                    .query_row("SELECT id FROM branches WHERE id = ?1", params![bid], |r| r.get(0))
+                    .query_row("SELECT id FROM branches WHERE id = ?1", params![bid], |r| {
+                        r.get(0)
+                    })
                     .optional()
                     .map_err(db_err)?,
                 None => None,
@@ -1310,8 +1534,16 @@ impl DatabaseManager {
                     )
                     .optional()
                     .map_err(db_err)?;
-                let toutes: Vec<&Anomalie> = f.anomalies.iter().chain(f.anomalies_contexte.iter()).collect();
-                let anomalies_json = if toutes.is_empty() { None } else { serde_json::to_string(&toutes).ok() };
+                let toutes: Vec<&Anomalie> = f
+                    .anomalies
+                    .iter()
+                    .chain(f.anomalies_contexte.iter())
+                    .collect();
+                let anomalies_json = if toutes.is_empty() {
+                    None
+                } else {
+                    serde_json::to_string(&toutes).ok()
+                };
                 match (&imp.contenu, deja) {
                     (_, Some(fid)) => {
                         tx.execute(
@@ -1364,7 +1596,8 @@ impl DatabaseManager {
             drop(st);
             for (fid, h) in rows {
                 if !hashes_gardes.contains(&h) {
-                    tx.execute("DELETE FROM bordereau_fichiers WHERE id = ?1", params![fid]).map_err(db_err)?;
+                    tx.execute("DELETE FROM bordereau_fichiers WHERE id = ?1", params![fid])
+                        .map_err(db_err)?;
                 }
             }
             Self::purger_contenus_orphelins(&tx)?;
@@ -1398,9 +1631,13 @@ impl DatabaseManager {
             total_commission_ttc: row.get(18)?,
             statut: row.get(19)?,
             lignes: Vec::new(),
-            anomalies: anomalies_json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(),
+            anomalies: anomalies_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default(),
             fichiers: Vec::new(),
-            facture: row.get::<_, Option<String>>(21)?.and_then(|j| serde_json::from_str(&j).ok()),
+            facture: row
+                .get::<_, Option<String>>(21)?
+                .and_then(|j| serde_json::from_str(&j).ok()),
             client_libelle: row.get(22)?,
         })
     }
@@ -1413,7 +1650,10 @@ impl DatabaseManager {
     pub fn get_all_bordereaux(&self) -> DbResult<Vec<Bordereau>> {
         let conn = self.get_connection()?;
         let mut stmt = conn
-            .prepare(&format!("SELECT {} FROM bordereaux ORDER BY id DESC", Self::BORDEREAU_COLS))
+            .prepare(&format!(
+                "SELECT {} FROM bordereaux ORDER BY id DESC",
+                Self::BORDEREAU_COLS
+            ))
             .map_err(db_err)?;
         let rows = stmt.query_map([], Self::map_bordereau).map_err(db_err)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
@@ -1423,7 +1663,10 @@ impl DatabaseManager {
         let conn = self.get_connection()?;
         let mut b = match conn
             .query_row(
-                &format!("SELECT {} FROM bordereaux WHERE id = ?1", Self::BORDEREAU_COLS),
+                &format!(
+                    "SELECT {} FROM bordereaux WHERE id = ?1",
+                    Self::BORDEREAU_COLS
+                ),
                 params![id],
                 Self::map_bordereau,
             )
@@ -1466,7 +1709,9 @@ impl DatabaseManager {
                     montant_ttc: row.get(13)?,
                     non_parametre: non_param_val != 0,
                     desactive: desactive_val != 0,
-                    contributions: contributions_json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(),
+                    contributions: contributions_json
+                        .and_then(|j| serde_json::from_str(&j).ok())
+                        .unwrap_or_default(),
                     source_code: None,
                     source_code_ministeriel: None,
                     source_type: None,
@@ -1477,18 +1722,30 @@ impl DatabaseManager {
         drop(l_stmt);
         drop(conn);
         b.fichiers = self.list_fichiers(id)?;
-        if b.client_libelle.as_deref().map_or(true, |s| s.trim().is_empty()) {
-            b.client_libelle = crate::calculation::CalculationEngine::libelle_clients_lignes(&b.lignes);
+        if b.client_libelle
+            .as_deref()
+            .map_or(true, |s| s.trim().is_empty())
+        {
+            b.client_libelle =
+                crate::calculation::CalculationEngine::libelle_clients_lignes(&b.lignes);
         }
         Ok(Some(b))
     }
 
     /// Enregistre la facture de l'intermédiaire (confirmation). Possible en brouillon ou validé, pas une fois réglé :
     /// elle ne modifie ni les taux ni les montants calculés du bordereau.
-    pub fn enregistrer_facture(&self, id: i64, facture: Option<&crate::models::FactureIntermediaire>) -> DbResult<()> {
+    pub fn enregistrer_facture(
+        &self,
+        id: i64,
+        facture: Option<&crate::models::FactureIntermediaire>,
+    ) -> DbResult<()> {
         let conn = self.get_connection()?;
         let statut: String = conn
-            .query_row("SELECT statut FROM bordereaux WHERE id = ?1", params![id], |r| r.get(0))
+            .query_row(
+                "SELECT statut FROM bordereaux WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(db_err)?
             .ok_or_else(|| format!("Bordereau #{} introuvable.", id))?;
@@ -1497,15 +1754,21 @@ impl DatabaseManager {
         }
         if let Some(f) = facture {
             if !crate::models::date_valide(&f.date) {
-                return Err(format!("Date de facture invalide « {} » : format attendu JJ/MM/AAAA.", f.date));
+                return Err(format!(
+                    "Date de facture invalide « {} » : format attendu JJ/MM/AAAA.",
+                    f.date
+                ));
             }
             if let Some((k, v)) = f.montants_ht.iter().find(|(_, v)| !v.is_finite()) {
                 return Err(format!("Montant invalide pour « {} » : {}", k, v));
             }
         }
         let json = facture.and_then(|f| serde_json::to_string(f).ok());
-        conn.execute("UPDATE bordereaux SET facture_json = ?1 WHERE id = ?2", params![json, id])
-            .map_err(db_err)?;
+        conn.execute(
+            "UPDATE bordereaux SET facture_json = ?1 WHERE id = ?2",
+            params![json, id],
+        )
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -1515,34 +1778,55 @@ impl DatabaseManager {
         }
         let conn = self.get_connection()?;
         let actuel: String = conn
-            .query_row("SELECT statut FROM bordereaux WHERE id = ?1", params![id], |r| r.get(0))
+            .query_row(
+                "SELECT statut FROM bordereaux WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(db_err)?
             .ok_or_else(|| format!("Bordereau #{} introuvable.", id))?;
         let autorise = matches!(
             (actuel.as_str(), statut),
-            ("BROUILLON", "VALIDE") | ("VALIDE", "BROUILLON") | ("VALIDE", "REGLE") | ("REGLE", "VALIDE")
+            ("BROUILLON", "VALIDE")
+                | ("VALIDE", "BROUILLON")
+                | ("VALIDE", "REGLE")
+                | ("REGLE", "VALIDE")
         ) || actuel == statut;
         if !autorise {
-            return Err(format!("Passage du statut {} à {} non autorisé.", actuel, statut));
+            return Err(format!(
+                "Passage du statut {} à {} non autorisé.",
+                actuel, statut
+            ));
         }
-        conn.execute("UPDATE bordereaux SET statut = ?1 WHERE id = ?2", params![statut, id])
-            .map_err(db_err)?;
+        conn.execute(
+            "UPDATE bordereaux SET statut = ?1 WHERE id = ?2",
+            params![statut, id],
+        )
+        .map_err(db_err)?;
         Ok(())
     }
 
     pub fn delete_bordereau(&self, id: i64) -> DbResult<()> {
         let conn = self.get_connection()?;
         let statut: String = conn
-            .query_row("SELECT statut FROM bordereaux WHERE id = ?1", params![id], |r| r.get(0))
+            .query_row(
+                "SELECT statut FROM bordereaux WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(db_err)?
             .ok_or_else(|| format!("Bordereau #{} introuvable.", id))?;
         if statut == "REGLE" {
-            return Err("Un bordereau réglé ne peut pas être supprimé (repassez-le d'abord en VALIDE).".to_string());
+            return Err(
+                "Un bordereau réglé ne peut pas être supprimé (repassez-le d'abord en VALIDE)."
+                    .to_string(),
+            );
         }
         // Lignes et fichiers supprimés en cascade
-        conn.execute("DELETE FROM bordereaux WHERE id = ?1", params![id]).map_err(db_err)?;
+        conn.execute("DELETE FROM bordereaux WHERE id = ?1", params![id])
+            .map_err(db_err)?;
         Self::purger_contenus_orphelins(&conn)
     }
 
@@ -1586,7 +1870,9 @@ impl DatabaseManager {
                     periode: r.get(10)?,
                     total_prime_nette: r.get(11)?,
                     nb_lignes: r.get(12)?,
-                    anomalies: an.and_then(|j| serde_json::from_str::<Vec<Anomalie>>(&j).ok()).unwrap_or_default(),
+                    anomalies: an
+                        .and_then(|j| serde_json::from_str::<Vec<Anomalie>>(&j).ok())
+                        .unwrap_or_default(),
                     selection: r.get(14)?,
                 })
             })
@@ -1594,7 +1880,13 @@ impl DatabaseManager {
         rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
     }
 
-    pub fn add_piece_jointe(&self, bordereau_id: i64, nom: &str, hash: &str, contenu: &[u8]) -> DbResult<i64> {
+    pub fn add_piece_jointe(
+        &self,
+        bordereau_id: i64,
+        nom: &str,
+        hash: &str,
+        contenu: &[u8],
+    ) -> DbResult<i64> {
         let nom = nom.trim();
         if nom.is_empty() {
             return Err("Nom de fichier manquant.".to_string());
@@ -1604,15 +1896,26 @@ impl DatabaseManager {
         }
         let conn = self.get_connection()?;
         let existe: Option<i64> = conn
-            .query_row("SELECT id FROM bordereaux WHERE id = ?1", params![bordereau_id], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM bordereaux WHERE id = ?1",
+                params![bordereau_id],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(db_err)?;
         if existe.is_none() {
             return Err(format!("Bordereau #{} introuvable.", bordereau_id));
         }
-        let ext = Path::new(nom).extension().and_then(|e| e.to_str()).unwrap_or("").to_uppercase();
-        conn.execute("INSERT OR IGNORE INTO fichiers_contenu (hash, contenu) VALUES (?1, ?2)", params![hash, contenu])
-            .map_err(db_err)?;
+        let ext = Path::new(nom)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_uppercase();
+        conn.execute(
+            "INSERT OR IGNORE INTO fichiers_contenu (hash, contenu) VALUES (?1, ?2)",
+            params![hash, contenu],
+        )
+        .map_err(db_err)?;
         conn.execute(
             "INSERT INTO bordereau_fichiers (bordereau_id, type_piece, nom_fichier, type_fichier, hash, taille, date_ajout)
              VALUES (?1, 'PIECE_JOINTE', ?2, ?3, ?4, ?5, ?6)",
@@ -1645,7 +1948,11 @@ impl DatabaseManager {
     pub fn delete_piece_jointe(&self, fichier_id: i64) -> DbResult<()> {
         let conn = self.get_connection()?;
         let type_piece: String = conn
-            .query_row("SELECT type_piece FROM bordereau_fichiers WHERE id = ?1", params![fichier_id], |r| r.get(0))
+            .query_row(
+                "SELECT type_piece FROM bordereau_fichiers WHERE id = ?1",
+                params![fichier_id],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(db_err)?
             .ok_or_else(|| format!("Fichier #{} introuvable.", fichier_id))?;
@@ -1654,12 +1961,19 @@ impl DatabaseManager {
                 "Un fichier source d'import ne peut pas être supprimé seul : il justifie le calcul du bordereau.".to_string(),
             );
         }
-        conn.execute("DELETE FROM bordereau_fichiers WHERE id = ?1", params![fichier_id]).map_err(db_err)?;
+        conn.execute(
+            "DELETE FROM bordereau_fichiers WHERE id = ?1",
+            params![fichier_id],
+        )
+        .map_err(db_err)?;
         Self::purger_contenus_orphelins(&conn)
     }
 }
 
 /// N° de police comparable d'un fichier à l'autre (sans espaces, en majuscules)
 pub fn normaliser_police(p: &str) -> String {
-    p.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase()
+    p.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_uppercase()
 }

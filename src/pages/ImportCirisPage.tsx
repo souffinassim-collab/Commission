@@ -559,8 +559,7 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
   const choisirIntermediaire = async (i: Intermediaire) => {
     setInterId(i.id ?? null);
     setTvaTaux(i.tva_applicable);
-    setCumul(i.type_intermediaire === 'COURTIER');
-    const p: Params = { ...paramsRef.current, inter: i, tva: i.tva_applicable, cumul: i.type_intermediaire === 'COURTIER' };
+    const p: Params = { ...paramsRef.current, inter: i, tva: i.tva_applicable };
     paramsRef.current = p;
     if (filesRef.current.length === 0) return;
     try {
@@ -743,7 +742,6 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
     setInterId(id);
     if (i) {
       setTvaTaux(i.tva_applicable);
-      setCumul(i.type_intermediaire === 'COURTIER');
     }
   };
 
@@ -1030,15 +1028,13 @@ export const ImportCirisPage: React.FC<ImportCirisPageProps> = ({ onBordereauSav
             </div>
           </div>
 
-          {isCourtier && (
-            <label className="flex items-start gap-2 pt-2 border-t border-slate-100 cursor-pointer">
-              <input type="checkbox" checked={cumul} disabled={locked} onChange={(e) => setCumul(e.target.checked)} className="mt-0.5" />
-              <span>
-                <span className="font-bold text-slate-800">Cumuler par groupe du bordereau courtier</span>
-                <span className="block text-[10px] text-slate-400">Regroupement défini dans les paramètres (colonne « Groupe bordereau »)</span>
-              </span>
-            </label>
-          )}
+          <label className="flex items-start gap-2 pt-2 border-t border-slate-100 cursor-pointer">
+            <input type="checkbox" checked={cumul} disabled={locked} onChange={(e) => setCumul(e.target.checked)} className="mt-0.5" />
+            <span>
+              <span className="font-bold text-slate-800">Cumuler par groupe du bordereau</span>
+              <span className="block text-[10px] text-slate-400">Regroupement défini dans les paramètres (colonne « Groupe bordereau »)</span>
+            </span>
+          </label>
         </div>
 
         {/* Dépôt & fichiers */}

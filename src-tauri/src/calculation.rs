@@ -84,8 +84,8 @@ impl CalculationEngine {
     ) -> Bordereau {
         let mut anomalies: Vec<Anomalie> = Vec::new();
         let is_courtier = req.type_intermediaire == "COURTIER";
-        // Regroupement "modèle officiel courtier" uniquement si le cumul par branche est demandé
-        let use_groups = is_courtier && req.cumuler_par_branche;
+        // Regroupement selon « groupe_bordereau » lorsque le cumul par groupe est activé (Courtier ou AGA)
+        let use_groups = req.cumuler_par_branche;
 
         let norm_police = |p: &str| p.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase();
 

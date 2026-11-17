@@ -118,7 +118,7 @@ fn parse_file_auto_bytes_brut(
         let doc = lopdf::Document::load_mem(bytes).map_err(|e| format!("Erreur lecture PDF: {:?}", e))?;
         let pages = extract_pages(&doc);
         if CirisPdfParser::is_ciris(&pages) {
-            CirisPdfParser::parse_pages(&pages, file_name, known_codes)
+            CirisPdfParser::parse_document(&doc, file_name, known_codes)
         } else {
             let res = FlottePdfParser::parse_pages(&pages, file_name, known_codes);
             if res.items.is_empty() && res.anomalies.is_empty() {

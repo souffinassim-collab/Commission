@@ -170,7 +170,7 @@ mod tests {
             tva_taux: inter.tva_applicable,
             exercice,
             mois,
-            cumuler_par_branche: true,
+            cumuler_par_branche: inter.type_intermediaire == "COURTIER",
         }
     }
 
@@ -996,5 +996,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_aga_regroupement_auto_par_groupe() {
+        let db = test_db();
+        // Vérifie que known_sous_codes inclut les alias d'import (utilisés quand les garanties sont regroupées)
+        let known = db.known_sous_codes().unwrap();
+        assert!(known.iter().any(|k| k == "VP"));
+        assert!(known.iter().any(|k| k == "MP"));
+
+        let Some((file, _)) = ciris_file(&db) else { return };
+        let aga = inter_by_code(&db, "492");
+        let branches = db.get_all_branches().unwrap();
+
+        // Avec cumul par groupe activé sur un AGA : VRC + VRCR + VRCE -> RC AUTOMOBILE (VO/VP/VR réunis),
+        // VASS -> ASSISTANCE AUTOMOBILE, VTR/VPT/VDR/... -> AUTOMOBILE FACULTATIF
+        let mut grouped_req = req_for(&aga, vec![file.clone()], 2025, Some(5));
+        grouped_req.cumuler_par_branche = true;
+        let grouped = CalculationEngine::compute_multi_bordereau(
+            &grouped_req,
+            &branches,
+            &std::collections::HashMap::new(),
+        );
+        assert!(grouped.anomalies_bloquantes().is_empty(), "{:?}", grouped.anomalies);
+        let rc = grouped.lignes.iter().find(|l| l.code_garantie == "RC AUTOMOBILE").expect("RC AUTOMOBILE");
+        let ass = grouped.lignes.iter().find(|l| l.code_garantie == "ASSISTANCE AUTOMOBILE").expect("ASSISTANCE AUTOMOBILE");
+        let fac = grouped.lignes.iter().find(|l| l.code_garantie == "AUTOMOBILE FACULTATIF").expect("AUTOMOBILE FACULTATIF");
+        assert!(rc.prime_nette > 0.0 && ass.prime_nette > 0.0 && fac.prime_nette > 0.0);
+        // En mode détaillé (cumul décoché), même total de primes nettes ; l'arrondi par ligne vs par groupe peut différer d'1 ou 2 centimes
+        let detail = CalculationEngine::compute_multi_bordereau(&req_for(&aga, vec![file], 2025, Some(5)), &branches, &std::collections::HashMap::new());
+        assert_eq!(grouped.total_prime_nette, detail.total_prime_nette);
+        assert!((grouped.total_commission_ht - detail.total_commission_ht).abs() <= 0.05);
+        assert!(grouped.lignes.len() < detail.lignes.len());
     }
 }

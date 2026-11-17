@@ -133,6 +133,185 @@ pub fn extract_pages(doc: &Document) -> Vec<String> {
     (1..=n).map(|p| doc.extract_text(&[p]).unwrap_or_default()).collect()
 }
 
+/// Multiplie deux matrices affines 2D `[a, b, c, d, e, f]` (convention PDF : vecteur ligne `[x y 1] * M1 * M2`).
+fn mul_mat(m1: [f32; 6], m2: [f32; 6]) -> [f32; 6] {
+    [
+        m1[0] * m2[0] + m1[1] * m2[2],
+        m1[0] * m2[1] + m1[1] * m2[3],
+        m1[2] * m2[0] + m1[3] * m2[2],
+        m1[2] * m2[1] + m1[3] * m2[3],
+        m1[4] * m2[0] + m1[5] * m2[2] + m2[4],
+        m1[4] * m2[1] + m1[5] * m2[3] + m2[5],
+    ]
+}
+
+fn mat_from_operands(ops: &[lopdf::Object]) -> Option<[f32; 6]> {
+    if ops.len() < 6 {
+        return None;
+    }
+    Some([
+        ops[0].as_float().ok()?,
+        ops[1].as_float().ok()?,
+        ops[2].as_float().ok()?,
+        ops[3].as_float().ok()?,
+        ops[4].as_float().ok()?,
+        ops[5].as_float().ok()?,
+    ])
+}
+
+/// Extrait les cellules textuelles d'une page PDF avec leurs coordonnées `(x, y)`, regroupées par ligne visuelle.
+/// Évite la concaténation de colonnes produite par `Document::extract_text` lorsque les cellules d'un tableau
+/// sont positionnées par `Td`/`TD`/`Tm` dans un même bloc `BT ... ET`.
+fn extract_page_rows(doc: &Document, page_number: u32) -> Option<Vec<Vec<(f32, String)>>> {
+    use lopdf::content::Content;
+    use lopdf::{Encoding, Object};
+    use std::collections::BTreeMap;
+
+    fn append_text(out: &mut String, encoding: Option<&Encoding>, operands: &[Object]) {
+        for op in operands {
+            match op {
+                Object::String(bytes, _) => {
+                    if let Some(enc) = encoding {
+                        if let Ok(s) = Document::decode_text(enc, bytes) {
+                            out.push_str(&s);
+                        }
+                    } else {
+                        out.push_str(&String::from_utf8_lossy(bytes));
+                    }
+                }
+                Object::Array(arr) => append_text(out, encoding, arr),
+                Object::Integer(i) if *i < -100 => out.push(' '),
+                Object::Real(r) if *r < -100.0 => out.push(' '),
+                _ => {}
+            }
+        }
+    }
+
+    let pages = doc.get_pages();
+    let page_id = *pages.get(&page_number)?;
+    let fonts = doc.get_page_fonts(page_id).ok()?;
+    let encodings: BTreeMap<Vec<u8>, Encoding> = fonts
+        .into_iter()
+        .filter_map(|(name, font)| font.get_font_encoding(doc).ok().map(|e| (name, e)))
+        .collect();
+    let content_data = doc.get_page_content(page_id).ok()?;
+    let content = Content::decode(&content_data).ok()?;
+
+    let ident = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let mut ctm = ident;
+    let mut ctm_stack: Vec<[f32; 6]> = Vec::new();
+    let mut tm = ident;
+    let mut tlm = ident;
+    let mut tl = 0.0f32;
+    let mut current_encoding: Option<&Encoding> = None;
+
+    let mut cur_text = String::new();
+    let mut cur_pos: Option<(f32, f32)> = None;
+    let mut tokens: Vec<(f32, f32, String)> = Vec::new();
+
+    let flush = |cur_text: &mut String, cur_pos: &mut Option<(f32, f32)>, tokens: &mut Vec<(f32, f32, String)>| {
+        if let Some((x, y)) = cur_pos.take() {
+            let trimmed = cur_text.trim();
+            if !trimmed.is_empty() {
+                tokens.push((x, y, trimmed.to_string()));
+            }
+        }
+        cur_text.clear();
+    };
+
+    for op in &content.operations {
+        match op.operator.as_ref() {
+            "q" => ctm_stack.push(ctm),
+            "Q" => ctm = ctm_stack.pop().unwrap_or(ident),
+            "cm" => {
+                if let Some(m) = mat_from_operands(&op.operands) {
+                    ctm = mul_mat(m, ctm);
+                }
+            }
+            "BT" => {
+                flush(&mut cur_text, &mut cur_pos, &mut tokens);
+                tm = ident;
+                tlm = ident;
+            }
+            "ET" => flush(&mut cur_text, &mut cur_pos, &mut tokens),
+            "Tf" => {
+                if let Some(name) = op.operands.first().and_then(|o| o.as_name().ok()) {
+                    current_encoding = encodings.get(name);
+                }
+            }
+            "TL" => {
+                if let Some(Ok(v)) = op.operands.first().map(|o| o.as_float()) {
+                    tl = v;
+                }
+            }
+            "Tm" => {
+                flush(&mut cur_text, &mut cur_pos, &mut tokens);
+                if let Some(m) = mat_from_operands(&op.operands) {
+                    tm = m;
+                    tlm = m;
+                }
+            }
+            "Td" | "TD" => {
+                flush(&mut cur_text, &mut cur_pos, &mut tokens);
+                if op.operands.len() >= 2 {
+                    if let (Ok(tx), Ok(ty)) = (op.operands[0].as_float(), op.operands[1].as_float()) {
+                        if op.operator == "TD" {
+                            tl = -ty;
+                        }
+                        tlm = mul_mat([1.0, 0.0, 0.0, 1.0, tx, ty], tlm);
+                        tm = tlm;
+                    }
+                }
+            }
+            "T*" => {
+                flush(&mut cur_text, &mut cur_pos, &mut tokens);
+                tlm = mul_mat([1.0, 0.0, 0.0, 1.0, 0.0, -tl], tlm);
+                tm = tlm;
+            }
+            "'" | "\"" => {
+                flush(&mut cur_text, &mut cur_pos, &mut tokens);
+                tlm = mul_mat([1.0, 0.0, 0.0, 1.0, 0.0, -tl], tlm);
+                tm = tlm;
+                let trm = mul_mat(tm, ctm);
+                cur_pos = Some((trm[4], trm[5]));
+                let str_ops = if op.operator == "\"" && op.operands.len() >= 3 {
+                    &op.operands[2..]
+                } else {
+                    &op.operands[..]
+                };
+                append_text(&mut cur_text, current_encoding, str_ops);
+            }
+            "Tj" | "TJ" => {
+                if cur_pos.is_none() {
+                    let trm = mul_mat(tm, ctm);
+                    cur_pos = Some((trm[4], trm[5]));
+                }
+                append_text(&mut cur_text, current_encoding, &op.operands);
+            }
+            _ => {}
+        }
+    }
+    flush(&mut cur_text, &mut cur_pos, &mut tokens);
+
+    // Tri de haut en bas (y décroissant), puis de gauche à droite (x croissant)
+    tokens.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.total_cmp(&b.0)));
+
+    let mut rows: Vec<(f32, Vec<(f32, String)>)> = Vec::new();
+    for (x, y, text) in tokens {
+        if let Some((ry, cols)) = rows.last_mut() {
+            if (*ry - y).abs() <= 2.5 {
+                cols.push((x, text));
+                continue;
+            }
+        }
+        rows.push((y, vec![(x, text)]));
+    }
+    for (_, cols) in &mut rows {
+        cols.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
+    Some(rows.into_iter().map(|(_, cols)| cols).collect())
+}
+
 /// Découpe une chaîne concaténée de codes (ex: "CANATRVACVDRVPT") en exactement `k` codes.
 /// Les codes connus (sous-codes des paramètres) sont privilégiés ; un code inconnu (2 à 6 lettres)
 /// n'est admis que s'il est indispensable pour obtenir exactement `k` codes.
@@ -255,10 +434,312 @@ fn finalize_result(
 
 pub struct CirisPdfParser;
 
+#[derive(Clone)]
 struct CirisBranche {
     code: String,
     libelle: String,
     code_ministeriel: Option<String>,
+}
+
+#[derive(Default)]
+struct CirisMeta {
+    agence_code: String,
+    agence_nom: String,
+    periode_debut: String,
+    periode_fin: String,
+    totaux_rapport: Vec<(String, f64)>,
+}
+
+impl CirisMeta {
+    fn scan_line(&mut self, line: &str) {
+        let l = line.trim();
+        if self.agence_code.is_empty() {
+            if let Some(idx) = l.find("Agence") {
+                let after = l[idx + "Agence".len()..].trim_start().trim_start_matches(':').trim();
+                let cut = ["Dépendances", "Devise", "Total", "Rapport"]
+                    .iter()
+                    .filter_map(|m| after.find(m))
+                    .min()
+                    .unwrap_or(after.len());
+                let clean = after[..cut].trim();
+                let mut words = clean.split_whitespace();
+                if let Some(first) = words.next() {
+                    let code: String = first.chars().filter(|c| c.is_alphanumeric()).collect();
+                    if !code.is_empty() && code.chars().any(|c| c.is_ascii_digit()) {
+                        self.agence_code = code;
+                        self.agence_nom = words
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .trim_start_matches('-')
+                            .trim()
+                            .to_string();
+                    }
+                }
+            }
+        }
+        if l.contains("mission") {
+            let d = dates_in(l);
+            if d.len() >= 2 && self.periode_debut.is_empty() {
+                self.periode_debut = d[0].clone();
+                self.periode_fin = d[1].clone();
+            } else if d.len() == 1 {
+                if self.periode_debut.is_empty() && l.contains("De la") {
+                    self.periode_debut = d[0].clone();
+                } else if self.periode_fin.is_empty() && l.contains("A la") {
+                    self.periode_fin = d[0].clone();
+                }
+            }
+        }
+        for label in ["Total par agence", "Total en devise locale", "Total par devise"] {
+            if let Some(idx) = l.find(label) {
+                if let Some(v) = en_amounts(&l[idx + label.len()..]).first() {
+                    self.totaux_rapport.push((label.to_string(), *v));
+                }
+            }
+        }
+    }
+}
+
+fn parse_ciris_branche_headers(line: &str) -> Vec<CirisBranche> {
+    let mut branches = Vec::new();
+    let mut rest: &str = line;
+    while let Some(idx) = rest.find("Branche") {
+        let after = rest[idx + "Branche".len()..].trim_start();
+        if !after.starts_with(':') {
+            rest = &rest[idx + "Branche".len()..];
+            continue;
+        }
+        let after = after[1..].trim_start();
+        let end = after.find("Branche").unwrap_or(after.len());
+        let seg = after[..end].trim();
+        let mut w = seg.split_whitespace();
+        if let Some(code) = w.next() {
+            let libelle = w.collect::<Vec<_>>().join(" ");
+            branches.push(CirisBranche {
+                code: code.to_string(),
+                code_ministeriel: code_ministeriel_from_label(&libelle),
+                libelle,
+            });
+        }
+        rest = &after[end..];
+    }
+    branches
+}
+
+fn push_ciris_item(
+    file_name: &str,
+    meta: &CirisMeta,
+    br: &CirisBranche,
+    code: String,
+    net: f64,
+    ttc: Option<f64>,
+    known_codes: &[String],
+    items: &mut Vec<ExtractedItem>,
+    anomalies: &mut Vec<Anomalie>,
+    total_lu: &mut f64,
+) {
+    *total_lu += net;
+    if !known_codes.iter().any(|k| *k == code) {
+        let msg = format!(
+            "Garantie « {} » (branche {} {}) absente des paramètres{}.",
+            code,
+            br.code,
+            br.libelle,
+            if net == 0.0 { " — montant nul, ignorée" } else { " — taux à paramétrer" }
+        );
+        anomalies.push(if net == 0.0 { Anomalie::info(msg) } else { Anomalie::avertissement(msg) });
+    }
+    if net == 0.0 {
+        return;
+    }
+    items.push(ExtractedItem {
+        fichier_source: file_name.to_string(),
+        police: None,
+        client_code: if meta.agence_code.is_empty() { None } else { Some(meta.agence_code.clone()) },
+        client_nom: if meta.agence_nom.is_empty() { None } else { Some(meta.agence_nom.clone()) },
+        libelle_garantie: code.clone(),
+        code_garantie: code,
+        branche_code: br.code.clone(),
+        branche_libelle: br.libelle.clone(),
+        prime_nette: net,
+        prime_ttc: ttc,
+        code_ministeriel: br.code_ministeriel.clone(),
+        source_type: "GARANTIE".to_string(),
+        date_emission: None,
+        date_effet: None,
+        date_echeance: None,
+        cp: None,
+    });
+}
+
+fn finalize_ciris_result(
+    file_name: &str,
+    meta: CirisMeta,
+    mut items: Vec<ExtractedItem>,
+    mut anomalies: Vec<Anomalie>,
+    total_lu: f64,
+) -> Result<UploadedFileResult, String> {
+    if items.is_empty() && !anomalies.iter().any(|a| a.est_bloquante()) {
+        return Err("Aucune garantie n'a pu être extraite de ce rapport CIRIS (format non reconnu ou PDF scanné sans couche texte).".to_string());
+    }
+
+    if !meta.agence_code.is_empty() {
+        for it in &mut items {
+            if it.client_code.is_none() {
+                it.client_code = Some(meta.agence_code.clone());
+            }
+            if it.client_nom.is_none() && !meta.agence_nom.is_empty() {
+                it.client_nom = Some(meta.agence_nom.clone());
+            }
+        }
+    }
+
+    if meta.totaux_rapport.is_empty() {
+        anomalies.push(Anomalie::avertissement(
+            "Total agence introuvable dans le rapport : contrôle du total impossible.",
+        ));
+    }
+    for (label, t) in &meta.totaux_rapport {
+        if (round2(total_lu) - t).abs() > TOLERANCE {
+            anomalies.push(Anomalie::erreur(format!(
+                "Total des garanties lues {} ≠ « {} » du rapport {} (écart {}).",
+                fmt_montant(round2(total_lu)),
+                label,
+                fmt_montant(*t),
+                fmt_montant(round2(t - total_lu))
+            )));
+        }
+    }
+    if meta.agence_code.is_empty() {
+        anomalies.push(Anomalie::erreur("Code agence introuvable dans le rapport CIRIS."));
+    }
+    if meta.periode_debut.is_empty() {
+        anomalies.push(Anomalie::erreur("Période d'émission introuvable dans le rapport CIRIS."));
+    }
+
+    let pd: Vec<&str> = meta.periode_debut.split('/').collect();
+    let pf: Vec<&str> = meta.periode_fin.split('/').collect();
+    let (mois, exercice) = if pd.len() == 3 {
+        (pd[1].parse::<i32>().ok(), pd[2].parse::<i32>().ok())
+    } else {
+        (None, None)
+    };
+    if pd.len() == 3 && pf.len() == 3 && (pd[1] != pf[1] || pd[2] != pf[2]) {
+        anomalies.push(Anomalie::avertissement(format!(
+            "La période du rapport ({} - {}) couvre plusieurs mois.",
+            meta.periode_debut, meta.periode_fin
+        )));
+    }
+
+    let mut res = finalize_result(
+        "ciris",
+        file_name,
+        "CIRIS_PDF",
+        if meta.agence_nom.is_empty() { None } else { Some(meta.agence_nom) },
+        if meta.agence_code.is_empty() { None } else { Some(meta.agence_code) },
+        if meta.periode_debut.is_empty() { None } else { Some(format!("{} - {}", meta.periode_debut, meta.periode_fin)) },
+        items,
+        anomalies,
+    );
+    res.mois = mois;
+    res.exercice = exercice;
+    Ok(res)
+}
+
+#[derive(Clone, Copy, Default)]
+struct CirisCols {
+    x_net: Option<f32>,
+    x_ttc: Option<f32>,
+    x_cpo: Option<f32>,
+}
+
+impl CirisCols {
+    fn detect(rows: &[Vec<(f32, String)>]) -> Self {
+        let mut cols = Self::default();
+        for row in rows {
+            for (x, s) in row {
+                let t = s.trim();
+                if cols.x_net.is_none()
+                    && *x > 200.0
+                    && t.starts_with("Primes Nettes")
+                    && !t.contains('+')
+                {
+                    cols.x_net = Some(*x);
+                }
+            }
+        }
+        if let Some(xn) = cols.x_net {
+            for row in rows {
+                for (x, s) in row {
+                    let t = s.trim();
+                    if cols.x_ttc.is_none() && *x > xn && t.contains("TTC") {
+                        cols.x_ttc = Some(*x);
+                    }
+                    if cols.x_cpo.is_none() && *x > xn && (t.contains("CPO") || t.contains("Primes Nettes +")) {
+                        cols.x_cpo = Some(*x);
+                    }
+                }
+            }
+        }
+        cols
+    }
+
+    fn amount_in(&self, row: &[(f32, String)], min_x: f32, max_x: f32) -> Option<f64> {
+        let joined: String = row
+            .iter()
+            .filter(|(x, _)| *x >= min_x && *x < max_x)
+            .map(|(_, s)| s.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        en_amounts(&joined).into_iter().next()
+    }
+
+    fn row_amounts(&self, row: &[(f32, String)]) -> (Option<f64>, Option<f64>) {
+        let Some(xn) = self.x_net else {
+            return (None, None);
+        };
+        let ttc_bound = self.x_ttc.map(|xt| xt - 15.0).unwrap_or(f32::INFINITY);
+        let net = self.amount_in(row, xn - 60.0, ttc_bound);
+        let ttc = self.x_ttc.and_then(|xt| {
+            let cpo_bound = self.x_cpo.map(|xc| xc - 15.0).unwrap_or(xt + 75.0);
+            self.amount_in(row, xt - 15.0, cpo_bound)
+        });
+        (net, ttc)
+    }
+}
+
+fn flush_ciris_branch(
+    page_num: u32,
+    file_name: &str,
+    meta: &CirisMeta,
+    current_branche: &mut Option<CirisBranche>,
+    branch_items: &mut Vec<(String, f64, Option<f64>)>,
+    total_branche: Option<f64>,
+    known_codes: &[String],
+    items: &mut Vec<ExtractedItem>,
+    anomalies: &mut Vec<Anomalie>,
+    total_lu: &mut f64,
+) {
+    let buffered = std::mem::take(branch_items);
+    let Some(br) = current_branche.take() else {
+        return;
+    };
+    let sum_net: f64 = buffered.iter().map(|(_, net, _)| *net).sum();
+    if let Some(tot) = total_branche {
+        if (round2(sum_net) - tot).abs() > TOLERANCE {
+            anomalies.push(Anomalie::erreur(format!(
+                "Page {} : branche {} — somme des garanties {} ≠ total de branche {}.",
+                page_num,
+                br.code,
+                fmt_montant(round2(sum_net)),
+                fmt_montant(tot)
+            )));
+            return;
+        }
+    }
+    for (code, net, ttc) in buffered {
+        push_ciris_item(file_name, meta, &br, code, net, ttc, known_codes, items, anomalies, total_lu);
+    }
 }
 
 impl CirisPdfParser {
@@ -269,61 +750,149 @@ impl CirisPdfParser {
     #[allow(dead_code)]
     pub fn parse_from_bytes(bytes: &[u8], file_name: &str, known_codes: &[String]) -> Result<UploadedFileResult, String> {
         let doc = Document::load_mem(bytes).map_err(|e| format!("Erreur lecture PDF: {:?}", e))?;
-        let pages = extract_pages(&doc);
-        Self::parse_pages(&pages, file_name, known_codes)
+        Self::parse_document(&doc, file_name, known_codes)
+    }
+
+    /// Extrait les tableaux CIRIS via les coordonnées réelles `(x, y)` de chaque cellule,
+    /// évitant la concaténation de codes de garanties produite par `extract_text`.
+    pub fn parse_document(doc: &Document, file_name: &str, known_codes: &[String]) -> Result<UploadedFileResult, String> {
+        let mut anomalies: Vec<Anomalie> = Vec::new();
+        let mut meta = CirisMeta::default();
+        let mut items: Vec<ExtractedItem> = Vec::new();
+        let mut total_lu = 0.0;
+
+        let mut page_nums: Vec<u32> = doc.get_pages().keys().copied().collect();
+        page_nums.sort_unstable();
+
+        let mut current_branche: Option<CirisBranche> = None;
+        let mut branch_items: Vec<(String, f64, Option<f64>)> = Vec::new();
+        let mut found_table = false;
+
+        for page_num in page_nums {
+            let Some(rows) = extract_page_rows(doc, page_num) else {
+                continue;
+            };
+            let cols = CirisCols::detect(&rows);
+
+            for row in rows {
+                let row_line: String = row.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join(" ");
+                meta.scan_line(&row_line);
+
+                let new_branches = parse_ciris_branche_headers(&row_line);
+                if !new_branches.is_empty() {
+                    if let Some(first) = new_branches.into_iter().last() {
+                        let same_open = current_branche.as_ref().map(|b| b.code == first.code).unwrap_or(false);
+                        if !same_open {
+                            if !branch_items.is_empty() {
+                                anomalies.push(Anomalie::avertissement(format!(
+                                    "Page {} : changement de branche sans « Total par branche » intermédiaire.",
+                                    page_num
+                                )));
+                                flush_ciris_branch(
+                                    page_num,
+                                    file_name,
+                                    &meta,
+                                    &mut current_branche,
+                                    &mut branch_items,
+                                    None,
+                                    known_codes,
+                                    &mut items,
+                                    &mut anomalies,
+                                    &mut total_lu,
+                                );
+                            }
+                            current_branche = Some(first);
+                        }
+                    }
+                    continue;
+                }
+
+                if row_line.contains("Total par branche") {
+                    found_table = true;
+                    let total_branche = cols
+                        .row_amounts(&row)
+                        .0
+                        .or_else(|| {
+                            row_line
+                                .find("Total par branche")
+                                .and_then(|idx| en_amounts(&row_line[idx..]).into_iter().next())
+                        });
+                    flush_ciris_branch(
+                        page_num,
+                        file_name,
+                        &meta,
+                        &mut current_branche,
+                        &mut branch_items,
+                        total_branche,
+                        known_codes,
+                        &mut items,
+                        &mut anomalies,
+                        &mut total_lu,
+                    );
+                    continue;
+                }
+
+                let Some(xn) = cols.x_net else {
+                    continue;
+                };
+                if current_branche.is_none()
+                    || row_line.contains("Total par")
+                    || row_line.contains("Agence")
+                    || row_line.contains("Page ")
+                {
+                    continue;
+                }
+                if let Some((x0, s0)) = row.first() {
+                    let code = s0.trim();
+                    let is_code = *x0 < xn - 150.0
+                        && code.len() >= 2
+                        && code.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                        && code.chars().any(|c| c.is_ascii_uppercase());
+                    if is_code {
+                        let (net, ttc) = cols.row_amounts(&row);
+                        if let Some(net_val) = net {
+                            found_table = true;
+                            branch_items.push((code.to_string(), net_val, ttc));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !branch_items.is_empty() {
+            anomalies.push(Anomalie::avertissement(
+                "Total par branche manquant en fin de rapport CIRIS.",
+            ));
+            let last_page = doc.get_pages().keys().copied().max().unwrap_or(1);
+            flush_ciris_branch(
+                last_page,
+                file_name,
+                &meta,
+                &mut current_branche,
+                &mut branch_items,
+                None,
+                known_codes,
+                &mut items,
+                &mut anomalies,
+                &mut total_lu,
+            );
+        }
+
+        if !found_table && items.is_empty() && !anomalies.iter().any(|a| a.est_bloquante()) {
+            let pages = extract_pages(doc);
+            return Self::parse_pages(&pages, file_name, known_codes);
+        }
+
+        finalize_ciris_result(file_name, meta, items, anomalies, total_lu)
     }
 
     pub fn parse_pages(pages: &[String], file_name: &str, known_codes: &[String]) -> Result<UploadedFileResult, String> {
         let mut anomalies: Vec<Anomalie> = Vec::new();
-
-        // --- Métadonnées ---
-        let mut agence_code = String::new();
-        let mut agence_nom = String::new();
-        let mut periode_debut = String::new();
-        let mut periode_fin = String::new();
-        let mut totaux_rapport: Vec<(String, f64)> = Vec::new();
+        let mut meta = CirisMeta::default();
 
         for text in pages {
             for line in text.lines() {
-                let l = line.trim();
-                if agence_code.is_empty() {
-                    if let Some(idx) = l.find("Agence") {
-                        let after = l[idx + "Agence".len()..].trim_start().trim_start_matches(':').trim();
-                        let cut = ["Dépendances", "Devise", "Total", "Rapport"]
-                            .iter()
-                            .filter_map(|m| after.find(m))
-                            .min()
-                            .unwrap_or(after.len());
-                        let clean = after[..cut].trim();
-                        let mut words = clean.split_whitespace();
-                        if let Some(first) = words.next() {
-                            let code: String = first.chars().filter(|c| c.is_alphanumeric()).collect();
-                            if !code.is_empty() && code.chars().any(|c| c.is_ascii_digit()) {
-                                agence_code = code;
-                                agence_nom = words
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                                    .trim_start_matches('-')
-                                    .trim()
-                                    .to_string();
-                            }
-                        }
-                    }
-                }
-                if periode_debut.is_empty() && l.contains("mission") {
-                    let d = dates_in(l);
-                    if d.len() >= 2 {
-                        periode_debut = d[0].clone();
-                        periode_fin = d[1].clone();
-                    }
-                }
-                for label in ["Total par agence", "Total en devise locale", "Total par devise"] {
-                    if let Some(idx) = l.find(label) {
-                        if let Some(v) = en_amounts(&l[idx + label.len()..]).first() {
-                            totaux_rapport.push((label.to_string(), *v));
-                        }
-                    }
-                }
+                meta.scan_line(line);
             }
         }
 
@@ -338,27 +907,7 @@ impl CirisPdfParser {
             // Branches de la page, dans l'ordre
             let mut branches: Vec<CirisBranche> = Vec::new();
             for line in &lines {
-                let mut rest: &str = line;
-                while let Some(idx) = rest.find("Branche") {
-                    let after = rest[idx + "Branche".len()..].trim_start();
-                    if !after.starts_with(':') {
-                        rest = &rest[idx + "Branche".len()..];
-                        continue;
-                    }
-                    let after = after[1..].trim_start();
-                    let end = after.find("Branche").unwrap_or(after.len());
-                    let seg = after[..end].trim();
-                    let mut w = seg.split_whitespace();
-                    if let Some(code) = w.next() {
-                        let libelle = w.collect::<Vec<_>>().join(" ");
-                        branches.push(CirisBranche {
-                            code: code.to_string(),
-                            code_ministeriel: code_ministeriel_from_label(&libelle),
-                            libelle,
-                        });
-                    }
-                    rest = &after[end..];
-                }
+                branches.extend(parse_ciris_branche_headers(line));
             }
 
             // Totaux par branche (N premiers montants = primes nettes)
@@ -462,97 +1011,22 @@ impl CirisPdfParser {
             }
 
             for ((code, net, ttc), bi) in page_items.into_iter().zip(assign.into_iter()) {
-                total_lu += net;
-                let br = &branches[bi];
-                if !known_codes.iter().any(|k| *k == code) {
-                    let msg = format!(
-                        "Garantie « {} » (branche {} {}) absente des paramètres{}.",
-                        code,
-                        br.code,
-                        br.libelle,
-                        if net == 0.0 { " — montant nul, ignorée" } else { " — taux à paramétrer" }
-                    );
-                    anomalies.push(if net == 0.0 { Anomalie::info(msg) } else { Anomalie::avertissement(msg) });
-                }
-                if net == 0.0 {
-                    continue;
-                }
-                items.push(ExtractedItem {
-                    fichier_source: file_name.to_string(),
-                    police: None,
-                    client_code: Some(agence_code.clone()),
-                    client_nom: Some(agence_nom.clone()),
-                    libelle_garantie: code.clone(),
-                    code_garantie: code,
-                    branche_code: br.code.clone(),
-                    branche_libelle: br.libelle.clone(),
-                    prime_nette: net,
-                    prime_ttc: ttc,
-                    code_ministeriel: br.code_ministeriel.clone(),
-                    source_type: "GARANTIE".to_string(),
-                    date_emission: None,
-                    date_effet: None,
-                    date_echeance: None,
-                    cp: None,
-                });
+                push_ciris_item(
+                    file_name,
+                    &meta,
+                    &branches[bi],
+                    code,
+                    net,
+                    ttc,
+                    known_codes,
+                    &mut items,
+                    &mut anomalies,
+                    &mut total_lu,
+                );
             }
         }
 
-        if items.is_empty() && !anomalies.iter().any(|a| a.est_bloquante()) {
-            return Err("Aucune garantie n'a pu être extraite de ce rapport CIRIS (format non reconnu ou PDF scanné sans couche texte).".to_string());
-        }
-
-        // --- Contrôles globaux ---
-        if totaux_rapport.is_empty() {
-            anomalies.push(Anomalie::avertissement(
-                "Total agence introuvable dans le rapport : contrôle du total impossible.",
-            ));
-        }
-        for (label, t) in &totaux_rapport {
-            if (round2(total_lu) - t).abs() > TOLERANCE {
-                anomalies.push(Anomalie::erreur(format!(
-                    "Total des garanties lues {} ≠ « {} » du rapport {} (écart {}).",
-                    fmt_montant(round2(total_lu)),
-                    label,
-                    fmt_montant(*t),
-                    fmt_montant(round2(t - total_lu))
-                )));
-            }
-        }
-        if agence_code.is_empty() {
-            anomalies.push(Anomalie::erreur("Code agence introuvable dans le rapport CIRIS."));
-        }
-        if periode_debut.is_empty() {
-            anomalies.push(Anomalie::erreur("Période d'émission introuvable dans le rapport CIRIS."));
-        }
-
-        let pd: Vec<&str> = periode_debut.split('/').collect();
-        let pf: Vec<&str> = periode_fin.split('/').collect();
-        let (mois, exercice) = if pd.len() == 3 {
-            (pd[1].parse::<i32>().ok(), pd[2].parse::<i32>().ok())
-        } else {
-            (None, None)
-        };
-        if pd.len() == 3 && pf.len() == 3 && (pd[1] != pf[1] || pd[2] != pf[2]) {
-            anomalies.push(Anomalie::avertissement(format!(
-                "La période du rapport ({} - {}) couvre plusieurs mois.",
-                periode_debut, periode_fin
-            )));
-        }
-
-        let mut res = finalize_result(
-            "ciris",
-            file_name,
-            "CIRIS_PDF",
-            if agence_nom.is_empty() { None } else { Some(agence_nom) },
-            if agence_code.is_empty() { None } else { Some(agence_code) },
-            if periode_debut.is_empty() { None } else { Some(format!("{} - {}", periode_debut, periode_fin)) },
-            items,
-            anomalies,
-        );
-        res.mois = mois;
-        res.exercice = exercice;
-        Ok(res)
+        finalize_ciris_result(file_name, meta, items, anomalies, total_lu)
     }
 }
 
@@ -1627,5 +2101,191 @@ Prime totale: -10.121,84
         // Sans choix du point de vente : bloquant (19 agences mélangées)
         let tout = ExcelProductionParser::parse_from_bytes(&bytes, "PROD2026.XLS", &ExcelSelection::default(), None).unwrap();
         assert!(tout.anomalies.iter().any(|a| a.est_bloquante() && a.message.contains("points de vente")));
+    }
+
+    #[test]
+    fn test_ciris_05_2025_sans_sous_codes() {
+        let pdf_path = std::path::Path::new("../Import/05-2025.PDF");
+        if !pdf_path.exists() {
+            return;
+        }
+        let bytes = std::fs::read(pdf_path).unwrap();
+        // Même sans aucun sous_code paramétré, les coordonnées PDF préservent chaque code intact
+        let res = CirisPdfParser::parse_from_bytes(&bytes, "05-2025.PDF", &[]).expect("parse");
+        assert!(!res.anomalies.iter().any(|a| a.est_bloquante()), "{:?}", res.anomalies);
+        assert_eq!(res.items.len(), 17);
+        assert_eq!(res.total_prime_nette, 2272025.22);
+        assert!(res.items.iter().any(|i| i.code_garantie == "VRC" && i.branche_code == "VR"));
+        assert!(res.items.iter().any(|i| i.code_garantie == "VRCR"));
+        assert!(res.items.iter().any(|i| i.code_garantie == "VTR"));
+        assert!(!res.items.iter().any(|i| i.code_garantie == "RVTR"));
+    }
+
+    fn build_synthetic_ciris_pdf(pages_streams: &[Vec<u8>]) -> Vec<u8> {
+        use lopdf::{Dictionary, Object, Stream, dictionary};
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let resources_id = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        });
+        let mut kids = Vec::new();
+        for stream_bytes in pages_streams {
+            let content_id = doc.add_object(Stream::new(Dictionary::new(), stream_bytes.clone()));
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 842.into(), 595.into()],
+                "Resources" => resources_id,
+                "Contents" => content_id,
+            });
+            kids.push(Object::Reference(page_id));
+        }
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => pages_streams.len() as i64,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn test_ciris_pdf_cellules_positionnees_et_conflit_alias() {
+        use std::fmt::Write as _;
+
+        // Page 1 : métadonnées avec dates sur deux lignes séparées (comme RCCBPG 1.23.5)
+        let p1 = b"BT /F1 10 Tf 50 500 Td (Production Par Garantie) Tj 0 -20 Td (Agence 492 - AGA ABDELLAH) Tj 0 -20 Td (De la date d'\xe9mission 01/10/2026) Tj 0 -20 Td (A la date d'\xe9mission 31/10/2026) Tj ET".to_vec();
+
+        // Page 2 & 3 : un seul bloc BT..ET pour tous les codes de la colonne Garantie (cas qui cassait extract_text)
+        let mut p2 = String::new();
+        p2.push_str("BT /F1 8 Tf ");
+        p2.push_str("1 0 0 1 10 540 Tm (Garantie) Tj ");
+        p2.push_str("1 0 0 1 130 540 Tm (Description Garantie) Tj ");
+        p2.push_str("1 0 0 1 512 540 Tm (Primes Nettes) Tj ");
+        p2.push_str("1 0 0 1 598 540 Tm (Primes TTC Police) Tj ");
+        p2.push_str("1 0 0 1 694 540 Tm (CPO) Tj ");
+
+        // En-têtes de branches & totaux sur page 2
+        let p2_rows: &[(&str, &str, f64, &str)] = &[
+            ("CANAT", "Catastrophes naturelles", 100000.00, "100,000.00"),
+            ("MPDE", "Dégâts des eaux", 920.00, "920.00"),
+            ("MPINC", "Incendie", 5000.00, "5,000.00"),
+            ("MPRP", "Risques divers", 3600.00, "3,600.00"),
+            ("MPVOL", "Vol", 12000.00, "12,000.00"),
+            ("RDCI", "Contrôle technique", 15000.00, "15,000.00"),
+            ("RDRC", "RC Décennale", 35660.58, "35,660.58"),
+            ("RVAC", "Accidents", 500.00, "500.00"),
+            ("RVTR", "Transport", 850.00, "850.00"),
+        ];
+        // Positions y des lignes sur page 2
+        // Branches : CA(520), MP(490), RD(410), RV(350)
+        p2.push_str("1 0 0 1 6 520 Tm (Branche : CA CATASTROPHES NATURELLES) Tj ");
+        p2.push_str("1 0 0 1 6 485 Tm (Total par branche) Tj 1 0 0 1 540 485 Tm (100,000.00) Tj ");
+        p2.push_str("1 0 0 1 6 470 Tm (Branche : MP MULTIRISQUES PROFESSIONNELLES ( 8.1.2.2 )) Tj ");
+        p2.push_str("1 0 0 1 6 405 Tm (Total par branche) Tj 1 0 0 1 540 405 Tm (21,520.00) Tj ");
+        p2.push_str("1 0 0 1 6 390 Tm (Branche : RD RC DECENNALE ( 13.5.1.0 )) Tj ");
+        p2.push_str("1 0 0 1 6 345 Tm (Total par branche) Tj 1 0 0 1 540 345 Tm (50,660.58) Tj ");
+        p2.push_str("1 0 0 1 6 330 Tm (Branche : RV RC VOITURIER (RC DU TRANSPORTEUR) ( 10.2.0.0 )) Tj ");
+        p2.push_str("1 0 0 1 6 285 Tm (Total par branche) Tj 1 0 0 1 540 285 Tm (1,350.00) Tj ET ");
+
+        let p2_ys = [505, 455, 442, 429, 416, 375, 362, 315, 302];
+        // Tous les codes dans un seul BT..ET avec TD (ce qui collait en "CANATMPDEMPINCMPRPMPVOLRDCIRDRCRVACRVTR")
+        p2.push_str("BT /F1 8 Tf 6 505 Td ");
+        for (idx, (code, _, _, _)) in p2_rows.iter().enumerate() {
+            let dy = if idx == 0 { 0 } else { p2_ys[idx] - p2_ys[idx - 1] };
+            let _ = write!(p2, "0 {} Td ({}) Tj ", dy, code);
+        }
+        p2.push_str("ET BT /F1 8 Tf 545 505 Td ");
+        for (idx, (_, _, _, amt)) in p2_rows.iter().enumerate() {
+            let dy = if idx == 0 { 0 } else { p2_ys[idx] - p2_ys[idx - 1] };
+            let _ = write!(p2, "0 {} Td ({}) Tj ", dy, amt);
+        }
+        p2.push_str("ET");
+
+        let mut p3 = String::new();
+        p3.push_str("BT /F1 8 Tf ");
+        p3.push_str("1 0 0 1 10 540 Tm (Garantie) Tj ");
+        p3.push_str("1 0 0 1 512 540 Tm (Primes Nettes) Tj ");
+        p3.push_str("1 0 0 1 598 540 Tm (Primes TTC Police) Tj ");
+        p3.push_str("1 0 0 1 694 540 Tm (CPO) Tj ");
+        p3.push_str("1 0 0 1 6 520 Tm (Branche : VO Assurance Extension De Territoire ( 3.1.0.3 )) Tj ");
+        p3.push_str("1 0 0 1 6 485 Tm (Total par branche) Tj 1 0 0 1 540 485 Tm (6,907.11) Tj ");
+        p3.push_str("1 0 0 1 6 470 Tm (Branche : VP AUTOMOBILE PARTICULIER ( 3.1.0.1 )) Tj ");
+        p3.push_str("1 0 0 1 6 240 Tm (Total par branche) Tj 1 0 0 1 540 240 Tm (2,641,348.00) Tj ");
+        p3.push_str("1 0 0 1 6 225 Tm (Branche : VR ASSURANCE FRONTIERE ( 3.1.0.1 )) Tj ");
+        p3.push_str("1 0 0 1 6 180 Tm (Total par branche) Tj 1 0 0 1 540 180 Tm (25,044.00) Tj ");
+        p3.push_str("1 0 0 1 6 160 Tm (Total par agence) Tj 1 0 0 1 540 160 Tm (2,846,829.69) Tj ET ");
+
+        let p3_rows: &[(&str, f64, &str)] = &[
+            ("VRCE", 6907.11, "6,907.11"),
+            ("VASS", 145119.99, "145,119.99"),
+            ("VBD", 20000.00, "20,000.00"),
+            ("VGVD", 30000.00, "30,000.00"),
+            ("VCVD", 40000.00, "40,000.00"),
+            ("VDR", 50000.00, "50,000.00"),
+            ("VINV", 60000.00, "60,000.00"),
+            ("VVOL", 100000.00, "100,000.00"),
+            ("VVPJ", 80000.00, "80,000.00"),
+            ("VPT", 200000.00, "200,000.00"),
+            ("VRC", 1500000.00, "1,500,000.00"),
+            ("VRCR", 150000.00, "150,000.00"),
+            ("VTR", 200000.00, "200,000.00"),
+            ("VRF", 50000.00, "50,000.00"),
+            ("VRV", 16228.01, "16,228.01"),
+            ("VVA", 0.00, "0.00"),
+            ("VDR", 0.00, "0.00"),
+            ("VRC", 25044.00, "25,044.00"),
+        ];
+        let p3_ys = [
+            505, 455, 442, 429, 416, 403, 390, 377, 364, 351, 338, 325, 312, 299, 286, 273, 210, 197,
+        ];
+        p3.push_str("BT /F1 8 Tf 6 505 Td ");
+        for (idx, (code, _, _)) in p3_rows.iter().enumerate() {
+            let dy = if idx == 0 { 0 } else { p3_ys[idx] - p3_ys[idx - 1] };
+            let _ = write!(p3, "0 {} Td ({}) Tj ", dy, code);
+        }
+        p3.push_str("ET BT /F1 8 Tf 545 505 Td ");
+        for (idx, (_, _, amt)) in p3_rows.iter().enumerate() {
+            let dy = if idx == 0 { 0 } else { p3_ys[idx] - p3_ys[idx - 1] };
+            let _ = write!(p3, "0 {} Td ({}) Tj ", dy, amt);
+        }
+        p3.push_str("ET");
+
+        let pdf_bytes = build_synthetic_ciris_pdf(&[p1, p2.into_bytes(), p3.into_bytes()]);
+        // Simulation exacte du conflit signalé : seulement CANAT et quelques alias courts (MP, RV, CR)
+        let partial_codes: Vec<String> = ["CANAT", "MP", "RV", "CR"].iter().map(|s| s.to_string()).collect();
+        let res = CirisPdfParser::parse_from_bytes(&pdf_bytes, "10-492.PDF", &partial_codes).expect("parse synthetic");
+
+        assert!(!res.anomalies.iter().any(|a| a.est_bloquante()), "{:?}", res.anomalies);
+        assert_eq!(res.code.as_deref(), Some("492"));
+        assert_eq!(res.mois, Some(10));
+        assert_eq!(res.exercice, Some(2026));
+        assert_eq!(res.total_prime_nette, 2846829.69);
+
+        let codes: Vec<&str> = res.items.iter().map(|i| i.code_garantie.as_str()).collect();
+        for expected in [
+            "CANAT", "MPDE", "MPINC", "MPRP", "MPVOL", "RDCI", "RDRC", "RVAC", "RVTR",
+            "VRCE", "VASS", "VBD", "VGVD", "VCVD", "VDR", "VINV", "VVOL", "VVPJ", "VPT",
+            "VRC", "VRCR", "VTR", "VRF", "VRV",
+        ] {
+            assert!(codes.contains(&expected), "code attendu manquant: {} dans {:?}", expected, codes);
+        }
+        for scrambled in ["DEMPI", "NCMPRP", "VOLRD", "CIRDRC", "ACRVTR", "CE", "VA", "SSVBD", "GVDCVD", "FVRV", "MP", "RV"] {
+            assert!(!codes.contains(&scrambled), "code tronqué/mélangé détecté: {}", scrambled);
+        }
     }
 }
